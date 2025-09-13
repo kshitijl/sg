@@ -12,6 +12,7 @@ from litestar.response import Response
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Tuple, Iterator
+from litestar.datastructures import State
 
 SKIP_DIRS = {
     ".git",
@@ -41,15 +42,15 @@ SKIP_EXTS = {
     ".gz",
 }
 
-# Global model (loaded once)
-model = None
-conn = None
-file_cache = {}
+
+@dataclass
+class AppState:
+    model: SentenceTransformer
+    conn: sqlite3.Connection
+    file_cache: Dict[str, str]
 
 
-def init_server():
-    global model, conn
-
+def create_app_state() -> AppState:
     # Get model name from embeddings file
     with h5py.File("embeddings.h5", "r") as f:
         model_name = f.attrs.get("model")
@@ -63,17 +64,19 @@ def init_server():
     conn = sqlite3.connect("index.db", check_same_thread=False)
     print("Server initialized")
 
+    return AppState(model=model, conn=conn, file_cache={})
 
-def file_content_from_cache(filepath: str) -> str:
-    if filepath not in file_cache:
+
+def file_content_from_cache(state: AppState, filepath: str) -> str:
+    if filepath not in state.file_cache:
         try:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                file_cache[filepath] = f.read()
+                state.file_cache[filepath] = f.read()
         except Exception:
-            file_cache[filepath] = ""
+            state.file_cache[filepath] = ""
     else:
         print(f"Found in cache {filepath}")
-    return file_cache[filepath]
+    return state.file_cache[filepath]
 
 
 @dataclass
@@ -81,6 +84,7 @@ class SearchResult:
     rank: int
     similarity: float
     filename: str
+    file_id: int
     chunk_content: str
     start_byte: int
     end_byte: int
@@ -161,14 +165,23 @@ def process_file(
     chunk_ranges = chunk_text(content, max_tokens)
     chunks = []
 
-    for chunk_range in chunk_ranges:
+    for chunk_idx, chunk_range in enumerate(chunk_ranges):
         (start_byte, end_byte) = chunk_range
         text = content[start_byte:end_byte]
+
+        # Add filename to first chunk only
+        if chunk_idx == 0:
+            embed_text = f"File: {path.name}\n\n{text}"
+        else:
+            embed_text = text
+
         chunk = Chunk(
             file_id=file_id,  # Will be set later
             start_byte=max(0, start_byte),
             end_byte=end_byte,
-            text=text,
+            # embed with the additional possible filename in first chunk
+            text=embed_text,
+            # hash the original text
             hash=hash_content(text),
         )
         chunks.append(chunk)
@@ -282,16 +295,13 @@ def create_index(
     )
 
 
-def search_embeddings(query: str, k: int = 50) -> List[SearchResult]:
-    global model, conn
-    assert model is not None
-    assert conn is not None
-
+def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchResult]:
     # Embed query
-    if hasattr(model, "encode_queries") and callable(getattr(model, "encode_queries")):
-        query_embedding = model.encode_queries([query])[0]
+    if hasattr(state.model, "encode_queries"):
+        assert callable(state.model.encode_queries)
+        query_embedding = state.model.encode_queries([query])[0]
     else:
-        query_embedding = model.encode([query])[0]
+        query_embedding = state.model.encode([query])[0]
 
     # Load embeddings
     with h5py.File("embeddings.h5", "r") as f:
@@ -305,9 +315,9 @@ def search_embeddings(query: str, k: int = 50) -> List[SearchResult]:
 
     # Get chunk metadata
     placeholders = ",".join("?" * len(top_indices))
-    rows = conn.execute(
+    rows = state.conn.execute(
         f"""
-        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte
+        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte, f.id
         FROM chunks c JOIN files f ON c.file_id = f.id
         WHERE c.matrix_index IN ({placeholders})
     """,
@@ -322,9 +332,9 @@ def search_embeddings(query: str, k: int = 50) -> List[SearchResult]:
         if idx not in index_to_row:
             continue
 
-        _, filename, start_byte, end_byte = index_to_row[idx]
+        _, filename, start_byte, end_byte, file_id = index_to_row[idx]
 
-        file_content = file_content_from_cache(filename)
+        file_content = file_content_from_cache(state, filename)
         chunk_content = file_content[start_byte:end_byte]
 
         results.append(
@@ -332,6 +342,7 @@ def search_embeddings(query: str, k: int = 50) -> List[SearchResult]:
                 rank=rank,
                 similarity=float(similarities[idx]),
                 filename=Path(filename).name,
+                file_id=file_id,
                 chunk_content=chunk_content,
                 start_byte=start_byte,
                 end_byte=end_byte,
@@ -349,12 +360,12 @@ async def serve_index() -> Response:
 
 
 @post("/search")
-async def search(data: Dict[str, Any]) -> Dict[str, Any]:
+async def search(data: Dict[str, Any], state: State) -> Dict[str, Any]:
     query = data.get("query", "").strip()
     if not query:
         return {"results": []}
 
-    results = search_embeddings(query)
+    results = search_embeddings(state.inner, query)
 
     return {
         "results": [
@@ -365,31 +376,28 @@ async def search(data: Dict[str, Any]) -> Dict[str, Any]:
                 "chunk_content": r.chunk_content,
                 "start_byte": r.start_byte,
                 "end_byte": r.end_byte,
+                "file_id": r.file_id,
             }
             for r in results
         ]
     }
 
 
-@get("/file/{filename:str}")
-async def get_file_content(
-    filename: str, start_byte: int, end_byte: int
-) -> Dict[str, Any]:
+@get("/file/{file_id:int}")
+async def get_file_content(file_id: int, state: State) -> Dict[str, Any]:
     try:
         # Find full path from database
-        conn = sqlite3.connect("index.db")
-        row = conn.execute(
-            "SELECT filename FROM files WHERE filename LIKE ?", (f"%{filename}",)
+        row = state.inner.conn.execute(
+            "SELECT filename FROM files WHERE id = ?", (f"{file_id}",)
         ).fetchone()
-        conn.close()
 
         if not row:
             return {"error": "File not found"}
 
         full_path = row[0]
-        content = file_content_from_cache(full_path)
+        content = file_content_from_cache(state.inner, full_path)
 
-        return {"content": content, "start_byte": start_byte, "end_byte": end_byte}
+        return {"content": content}
     except Exception as e:
         return {"error": str(e)}
 
@@ -413,12 +421,13 @@ def main():
     elif args.command == "search":
         import uvicorn
 
-        init_server()
-
+        app = Litestar(
+            route_handlers=[serve_index, search, get_file_content],
+            debug=True,
+        )
+        app.state.inner = create_app_state()
         uvicorn.run(app, host="127.0.0.1", port=8000)
 
-
-app = Litestar(route_handlers=[serve_index, search, get_file_content], debug=True)
 
 if __name__ == "__main__":
     main()

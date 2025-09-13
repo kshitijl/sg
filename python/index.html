@@ -271,6 +271,10 @@
         const query = searchInput.value.trim();
         if (!query) return;
 
+        // Scroll results panel to top
+        const resultsPanel = document.querySelector(".results-panel");
+        resultsPanel.scrollTop = 0;
+
         searchBtn.disabled = true;
         searchBtn.innerHTML = '<span class="spinner"></span>Searching...';
 
@@ -337,9 +341,7 @@
         fileContent.textContent = "Loading file...";
 
         try {
-          const response = await fetch(
-            `/file/${result.filename}?start_byte=${result.start_byte}&end_byte=${result.end_byte}`,
-          );
+          const response = await fetch(`/file/${result.file_id}`);
           const data = await response.json();
 
           if (data.error) {
