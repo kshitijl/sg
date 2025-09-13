@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Code Search</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #0d1117;
+        color: #e6edf3;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .container {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .search-header {
+        padding: 20px;
+        background: #161b22;
+        border-bottom: 1px solid #30363d;
+      }
+
+      .search-box {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .search-input {
+        flex: 1;
+        padding: 12px 16px;
+        background: #21262d;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        color: #e6edf3;
+        font-size: 14px;
+      }
+
+      .search-input:focus {
+        outline: none;
+        border-color: #58a6ff;
+        box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+      }
+
+      .search-btn {
+        padding: 12px 24px;
+        background: #238636;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+      }
+
+      .search-btn:hover {
+        background: #2ea043;
+      }
+
+      .search-btn:disabled {
+        background: #30363d;
+        cursor: not-allowed;
+      }
+
+      .content {
+        flex: 1;
+        display: flex;
+        overflow: hidden;
+      }
+
+      .results-panel {
+        width: 60%;
+        background: #0d1117;
+        overflow: auto;
+        border-right: 1px solid #30363d;
+      }
+
+      .file-panel {
+        width: 40%;
+        background: #161b22;
+        overflow: auto;
+      }
+
+      .results-table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      .results-table th {
+        background: #21262d;
+        padding: 12px;
+        text-align: left;
+        font-weight: 600;
+        border-bottom: 1px solid #30363d;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+
+      .results-table td {
+        padding: 12px;
+        border-bottom: 1px solid #21262d;
+        vertical-align: top;
+      }
+
+      .result-row {
+        cursor: pointer;
+        transition: background-color 0.1s;
+      }
+
+      .result-row:hover {
+        background: #161b22;
+      }
+
+      .result-row.selected {
+        background: #1c2128;
+        border-left: 3px solid #58a6ff;
+      }
+
+      .similarity {
+        font-family: "SF Mono", Monaco, monospace;
+        font-size: 12px;
+        color: #7d8590;
+      }
+
+      .filename {
+        color: #58a6ff;
+        font-weight: 500;
+      }
+
+      .chunk-preview {
+        max-width: 300px;
+        white-space: pre-wrap;
+        font-family: "SF Mono", Monaco, monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        color: #c9d1d9;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-height: 100px;
+      }
+
+      .file-content {
+        padding: 20px;
+        font-family: "SF Mono", Monaco, monospace;
+        font-size: 13px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        color: #c9d1d9;
+      }
+
+      .file-header {
+        padding: 15px 20px;
+        background: #21262d;
+        border-bottom: 1px solid #30363d;
+        font-weight: 600;
+        color: #58a6ff;
+      }
+
+      .highlight {
+        background: #ffd33d22;
+        border-radius: 3px;
+        padding: 0 2px;
+      }
+
+      .loading {
+        text-align: center;
+        padding: 40px;
+        color: #7d8590;
+      }
+
+      .empty-state {
+        text-align: center;
+        padding: 40px;
+        color: #7d8590;
+      }
+
+      .spinner {
+        display: inline-block;
+        width: 16px;
+        height: 16px;
+        border: 2px solid #30363d;
+        border-radius: 50%;
+        border-top-color: #58a6ff;
+        animation: spin 1s ease-in-out infinite;
+        margin-right: 8px;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="search-header">
+        <div class="search-box">
+          <input
+            type="text"
+            id="searchInput"
+            class="search-input"
+            placeholder="Search your codebase..."
+            autocomplete="off"
+          />
+          <button id="searchBtn" class="search-btn">Search</button>
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="results-panel">
+          <table class="results-table">
+            <thead>
+              <tr>
+                <th width="60">#</th>
+                <th width="80">Score</th>
+                <th width="150">File</th>
+                <th>Content</th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody">
+              <tr>
+                <td colspan="4" class="empty-state">
+                  Enter a search query to find code snippets
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="file-panel">
+          <div class="file-header" id="fileHeader">
+            Select a result to view file
+          </div>
+          <div class="file-content" id="fileContent"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      let currentResults = [];
+      let selectedIndex = -1;
+
+      const searchInput = document.getElementById("searchInput");
+      const searchBtn = document.getElementById("searchBtn");
+      const resultsBody = document.getElementById("resultsBody");
+      const fileHeader = document.getElementById("fileHeader");
+      const fileContent = document.getElementById("fileContent");
+
+      searchInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") {
+          performSearch();
+        }
+      });
+
+      searchBtn.addEventListener("click", performSearch);
+
+      async function performSearch() {
+        const query = searchInput.value.trim();
+        if (!query) return;
+
+        searchBtn.disabled = true;
+        searchBtn.innerHTML = '<span class="spinner"></span>Searching...';
+
+        try {
+          const response = await fetch("/search", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ query }),
+          });
+
+          const data = await response.json();
+          currentResults = data.results || [];
+          displayResults();
+        } catch (error) {
+          console.error("Search error:", error);
+          resultsBody.innerHTML =
+            '<tr><td colspan="4" class="empty-state">Search error occurred</td></tr>';
+        } finally {
+          searchBtn.disabled = false;
+          searchBtn.textContent = "Search";
+        }
+      }
+
+      function displayResults() {
+        if (currentResults.length === 0) {
+          resultsBody.innerHTML =
+            '<tr><td colspan="4" class="empty-state">No results found</td></tr>';
+          fileContent.textContent = "";
+          fileHeader.textContent = "No file selected";
+          return;
+        }
+
+        resultsBody.innerHTML = currentResults
+          .map(
+            (result, index) => `
+                <tr class="result-row" onclick="selectResult(${index})">
+                    <td>${result.rank}</td>
+                    <td class="similarity">${result.similarity.toFixed(3)}</td>
+                    <td class="filename">${result.filename}</td>
+                    <td class="chunk-preview">${escapeHtml(result.chunk_content.substring(0, 200))}${result.chunk_content.length > 200 ? "..." : ""}</td>
+                </tr>
+            `,
+          )
+          .join("");
+
+        // Auto-select first result
+        if (currentResults.length > 0) {
+          selectResult(0);
+        }
+      }
+
+      async function selectResult(index) {
+        selectedIndex = index;
+        const result = currentResults[index];
+
+        // Update selected row styling
+        document.querySelectorAll(".result-row").forEach((row, i) => {
+          row.classList.toggle("selected", i === index);
+        });
+
+        fileHeader.textContent = result.filename;
+        fileContent.textContent = "Loading file...";
+
+        try {
+          const response = await fetch(
+            `/file/${result.filename}?start_byte=${result.start_byte}&end_byte=${result.end_byte}`,
+          );
+          const data = await response.json();
+
+          if (data.error) {
+            fileContent.textContent = `Error: ${data.error}`;
+            return;
+          }
+
+          const beforeChunk = data.content.substring(0, result.start_byte);
+          const chunkContent = data.content.substring(
+            result.start_byte,
+            result.end_byte,
+          );
+          const afterChunk = data.content.substring(result.end_byte);
+
+          fileContent.innerHTML =
+            escapeHtml(beforeChunk) +
+            '<span class="highlight">' +
+            escapeHtml(chunkContent) +
+            "</span>" +
+            escapeHtml(afterChunk);
+
+          setTimeout(() => {
+            const highlightElement =
+              document.getElementById("highlighted-chunk");
+            if (highlightElement) {
+              highlightElement.scrollIntoView({
+                behavior: "smooth",
+                block: "center",
+              });
+            }
+          }, 100);
+        } catch (error) {
+          fileContent.textContent = "Error loading file";
+        }
+      }
+
+      function escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
+      }
+    </script>
+  </body>
+</html>
