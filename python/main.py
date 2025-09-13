@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from litestar import Litestar, get, post
 from litestar.response import Response
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from typing import List, Dict, Any, Tuple, Iterator
 from litestar.datastructures import State
 
@@ -27,6 +27,7 @@ SKIP_DIRS = {
 SKIP_EXTS = {
     ".pyc",
     ".pyo",
+    ".webp",
     ".so",
     ".dylib",
     ".dll",
@@ -46,7 +47,9 @@ SKIP_EXTS = {
 @dataclass
 class AppState:
     model: SentenceTransformer
+    cross_encoder: CrossEncoder
     conn: sqlite3.Connection
+    embeddings: np.ndarray
     file_cache: Dict[str, str]
 
 
@@ -56,15 +59,25 @@ def create_app_state() -> AppState:
         model_name = f.attrs.get("model")
         if not model_name:
             raise AttributeError("couldnt find model name in embeddings file!")
+        embeddings = f["embeddings"][:]
 
     print(f"Loading model: {model_name}")
     model = SentenceTransformer(model_name)
+
+    print("Loading cross-encoder...")
+    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
 
     # Open persistent DB connection
     conn = sqlite3.connect("index.db", check_same_thread=False)
     print("Server initialized")
 
-    return AppState(model=model, conn=conn, file_cache={})
+    return AppState(
+        model=model,
+        cross_encoder=cross_encoder,
+        embeddings=embeddings,
+        conn=conn,
+        file_cache={},
+    )
 
 
 def file_content_from_cache(state: AppState, filepath: str) -> str:
@@ -296,24 +309,27 @@ def create_index(
 
 
 def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchResult]:
-    # Embed query
+    total_search_start_time = time.time()
+    embed_start_time = time.time()
     if hasattr(state.model, "encode_queries"):
         assert callable(state.model.encode_queries)
         query_embedding = state.model.encode_queries([query])[0]
     else:
         query_embedding = state.model.encode([query])[0]
+    embed_end_time = time.time()
 
-    # Load embeddings
-    with h5py.File("embeddings.h5", "r") as f:
-        embeddings = f["embeddings"][:]
-
+    search_start_time = time.time()
     # Compute similarities
-    similarities = np.dot(embeddings, query_embedding)
+    similarities = np.dot(state.embeddings, query_embedding)
+    search_end_time = time.time()
+
+    sort_start_time = time.time()
     top_indices = heapq.nlargest(
         k, range(len(similarities)), key=similarities.__getitem__
     )
+    sort_end_time = time.time()
 
-    # Get chunk metadata
+    chunk_retrieval_start_time = time.time()
     placeholders = ",".join("?" * len(top_indices))
     rows = state.conn.execute(
         f"""
@@ -323,31 +339,79 @@ def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchRe
     """,
         top_indices,
     ).fetchall()
+    chunk_retrieval_end_time = time.time()
 
-    # Build results with file content
+    build_results_start_time = time.time()
     index_to_row = {row[0]: row for row in rows}
-    results = []
 
-    for rank, idx in enumerate(top_indices, 1):
+    candidates = []
+    for idx in top_indices:
         if idx not in index_to_row:
             continue
 
         _, filename, start_byte, end_byte, file_id = index_to_row[idx]
 
-        file_content = file_content_from_cache(state, filename)
-        chunk_content = file_content[start_byte:end_byte]
+        try:
+            content = file_content_from_cache(state, filename)
+            chunk_content = content[start_byte:end_byte]
+            candidates.append(
+                {
+                    "idx": idx,
+                    "file_id": file_id,
+                    "filename": filename,
+                    "chunk_content": chunk_content,
+                    "start_byte": start_byte,
+                    "end_byte": end_byte,
+                    "bi_encoder_score": float(similarities[idx]),
+                }
+            )
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
 
+    build_results_end_time = time.time()
+
+    if candidates:
+        query_passage_pairs = []
+        for c in candidates:
+            cross_encoder_input = f"File: {c['filename']}. {c['chunk_content']}"
+            query_passage_pairs.append([query, cross_encoder_input])
+        cross_encoding_start_time = time.time()
+        cross_scores = state.cross_encoder.predict(query_passage_pairs)
+        cross_encoding_end_time = time.time()
+
+        for i, candidate in enumerate(candidates):
+            candidate["cross_score"] = float(cross_scores[i])
+
+        candidates.sort(key=lambda x: x["cross_score"], reverse=True)
+
+    results = []
+
+    for rank, candidate in enumerate(candidates, 1):
         results.append(
             SearchResult(
                 rank=rank,
-                similarity=float(similarities[idx]),
-                filename=Path(filename).name,
-                file_id=file_id,
-                chunk_content=chunk_content,
-                start_byte=start_byte,
-                end_byte=end_byte,
+                similarity=candidate["cross_score"],
+                file_id=candidate["file_id"],
+                filename=Path(candidate["filename"]).name,
+                chunk_content=candidate["chunk_content"],
+                start_byte=candidate["start_byte"],
+                end_byte=candidate["end_byte"],
             )
         )
+
+    total_search_end_time = time.time()
+
+    timings = {
+        "embed": embed_end_time - embed_start_time,
+        "search": search_end_time - search_start_time,
+        "sort": sort_end_time - sort_start_time,
+        "chunk_retrieval": chunk_retrieval_end_time - chunk_retrieval_start_time,
+        "build_results": build_results_end_time - build_results_start_time,
+        "cross_encode": cross_encoding_end_time - cross_encoding_start_time,
+        "total": total_search_end_time - total_search_start_time,
+    }
+    for label, duration in sorted(timings.items(), key=lambda x: x[1], reverse=True):
+        print(f"{label}: {duration:.2f}s")
 
     return results
 
