@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Code Search</title>
+    <title>sg: semantic grep</title>
     <style>
       * {
         box-sizing: border-box;
@@ -356,7 +356,7 @@
 
           fileContent.innerHTML =
             escapeHtml(beforeChunk) +
-            '<span class="highlight">' +
+            '<span class="highlight" id="highlighted-chunk">' +
             escapeHtml(chunkContent) +
             "</span>" +
             escapeHtml(afterChunk);
