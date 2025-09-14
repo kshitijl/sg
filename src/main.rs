@@ -1,5 +1,5 @@
 use anyhow::{Error as E, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{Device, IndexOp, Tensor};
 use candle_transformers::models::{
     bert::{BertModel, Config, DTYPE},
     mimi::candle_nn,
@@ -75,13 +75,27 @@ fn main() -> Result<()> {
     // get embeddings
     let embeddings = model.forward(&token_ids, &token_ids.zeros_like()?, None)?;
     println!("Embeddings shape: {:?}", embeddings.dims());
+    let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
 
+    // print first few dims
+    println!("CLS embedding shape: {:?}", cls_emb.dims());
+    println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
     // pooling
-    let (b_size, n_tokens, _) = embeddings.dims3()?;
+    let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
     dbg!(b_size, n_tokens);
 
-    let attention_mask = token_ids.ne(0i64)?.to_dtype(DTYPE)?.unsqueeze(2)?;
-    // let attention_mask = token_ids.ne(0f32)?.unsqueeze(2)?.to_dtype(DTYPE)?;
+    let attention_masks: Vec<Tensor> = tokens
+        .iter()
+        .map(|tokens| {
+            let mask = tokens.get_attention_mask().to_vec();
+            Tensor::new(mask.as_slice(), &device).map_err(E::msg)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let attention_mask = Tensor::stack(&attention_masks, 0)?
+        .to_dtype(DTYPE)?
+        .unsqueeze(2)?;
+
     let embeddings = (embeddings.broadcast_mul(&attention_mask))?.sum(1)?;
     let sum_mask = attention_mask.sum(1)?;
     let embeddings = embeddings.broadcast_div(&sum_mask)?;
