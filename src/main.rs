@@ -44,12 +44,21 @@ fn main() -> Result<()> {
     ];
 
     // tokenize
+
     if let Some(pp) = tokenizer.get_padding_mut() {
         pp.strategy = tokenizers::PaddingStrategy::BatchLongest;
+        pp.pad_to_multiple_of = None;
     }
 
+    if let Some(tp) = tokenizer.get_truncation_mut() {
+        tp.max_length = 512;
+        tp.strategy = tokenizers::TruncationStrategy::LongestFirst;
+    }
     let tokens = tokenizer
-        .encode_batch(sentences.to_vec(), true)
+        .encode_batch(
+            sentences.to_vec(),
+            true, // add_special_tokens
+        )
         .map_err(E::msg)?;
 
     let token_ids = tokens
@@ -61,6 +70,7 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let token_ids = Tensor::stack(&token_ids, 0)?;
+    dbg!(token_ids.to_string());
 
     // get embeddings
     let embeddings = model.forward(&token_ids, &token_ids.zeros_like()?, None)?;
@@ -69,7 +79,9 @@ fn main() -> Result<()> {
     // pooling
     let (b_size, n_tokens, _) = embeddings.dims3()?;
     dbg!(b_size, n_tokens);
-    let attention_mask = token_ids.ne(0f32)?.unsqueeze(2)?.to_dtype(DTYPE)?;
+
+    let attention_mask = token_ids.ne(0i64)?.to_dtype(DTYPE)?.unsqueeze(2)?;
+    // let attention_mask = token_ids.ne(0f32)?.unsqueeze(2)?.to_dtype(DTYPE)?;
     let embeddings = (embeddings.broadcast_mul(&attention_mask))?.sum(1)?;
     let sum_mask = attention_mask.sum(1)?;
     let embeddings = embeddings.broadcast_div(&sum_mask)?;

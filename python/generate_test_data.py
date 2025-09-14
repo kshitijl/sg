@@ -1,4 +1,5 @@
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
 
 # 1. Load a pretrained Sentence Transformer model
 model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -18,3 +19,6 @@ print(embeddings.shape)
 # 3. Calculate the embedding similarities
 similarities = model.similarity(embeddings, embeddings)
 print(similarities)
+
+tok = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+print(tok(sentences, padding=True, truncation=True)["input_ids"])
