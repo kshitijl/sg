@@ -12,7 +12,8 @@ fn main() -> Result<()> {
     let device = if candle_core::utils::cuda_is_available() {
         Device::new_cuda(0)?
     } else if candle_core::utils::metal_is_available() {
-        Device::new_metal(0)?
+        // Device::new_metal(0)?
+        Device::Cpu
     } else {
         Device::Cpu
     };
@@ -71,19 +72,6 @@ fn main() -> Result<()> {
 
     let token_ids = Tensor::stack(&token_ids, 0)?;
     dbg!(token_ids.to_string());
-
-    // get embeddings
-    let embeddings = model.forward(&token_ids, &token_ids.zeros_like()?, None)?;
-    println!("Embeddings shape: {:?}", embeddings.dims());
-    let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
-
-    // print first few dims
-    println!("CLS embedding shape: {:?}", cls_emb.dims());
-    println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
-    // pooling
-    let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
-    dbg!(b_size, n_tokens);
-
     let attention_masks: Vec<Tensor> = tokens
         .iter()
         .map(|tokens| {
@@ -95,6 +83,18 @@ fn main() -> Result<()> {
     let attention_mask = Tensor::stack(&attention_masks, 0)?
         .to_dtype(DTYPE)?
         .unsqueeze(2)?;
+
+    // get embeddings
+    let embeddings = model.forward(&token_ids, &token_ids.zeros_like()?, Some(&attention_mask))?;
+    println!("Embeddings shape: {:?}", embeddings.dims());
+    let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
+
+    // print first few dims
+    println!("CLS embedding shape: {:?}", cls_emb.dims());
+    println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
+    // pooling
+    let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
+    dbg!(b_size, n_tokens);
 
     let embeddings = (embeddings.broadcast_mul(&attention_mask))?.sum(1)?;
     let sum_mask = attention_mask.sum(1)?;
