@@ -21,9 +21,10 @@ fn main() -> Result<()> {
     println!("Using device {:?}", device);
 
     let api = Api::new()?;
-    let repo = api.repo(Repo::new(
+    let repo = api.repo(Repo::with_revision(
         "sentence-transformers/all-MiniLM-L6-v2".to_string(),
         RepoType::Model,
+        "ea78891063587eb050ed4166b20062eaf978037c".to_string(),
     ));
     let config_filename = repo.get("config.json")?;
     let tokenizer_filename = repo.get("tokenizer.json")?;
@@ -71,22 +72,32 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let token_ids = Tensor::stack(&token_ids, 0)?;
-    dbg!(token_ids.to_string());
-    let attention_masks: Vec<Tensor> = tokens
+    println!("Token ids: {}", token_ids.to_string());
+
+    // --- START: The Fix ---
+
+    // 1. Create the 2D attention mask from the tokenizer output.
+    let attention_masks_2d_vec: Vec<Tensor> = tokens
         .iter()
         .map(|tokens| {
+            // get_attention_mask() returns u32, which is what Tensor::new expects
             let mask = tokens.get_attention_mask().to_vec();
             Tensor::new(mask.as_slice(), &device).map_err(E::msg)
         })
         .collect::<Result<Vec<_>>>()?;
+    let attention_mask_2d = Tensor::stack(&attention_masks_2d_vec, 0)?;
 
-    let attention_mask = Tensor::stack(&attention_masks, 0)?
-        .to_dtype(DTYPE)?
-        .unsqueeze(2)?;
+    // 2. The `token_type_ids` are all zeros for single sentences.
+    let token_type_ids = token_ids.zeros_like()?;
 
-    // get embeddings
-    let embeddings = model.forward(&token_ids, &token_ids.zeros_like()?, Some(&attention_mask))?;
+    // 3. Get embeddings using the correct 2D attention mask.
+    let embeddings = model.forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
     println!("Embeddings shape: {:?}", embeddings.dims());
+
+    // 4. For pooling, create a 3D version of the mask.
+    let attention_mask_3d = attention_mask_2d.to_dtype(DTYPE)?.unsqueeze(2)?;
+
+    // --- END: The Fix ---
     let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
 
     // print first few dims
@@ -96,8 +107,8 @@ fn main() -> Result<()> {
     let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
     dbg!(b_size, n_tokens);
 
-    let embeddings = (embeddings.broadcast_mul(&attention_mask))?.sum(1)?;
-    let sum_mask = attention_mask.sum(1)?;
+    let embeddings = (embeddings.broadcast_mul(&attention_mask_3d))?.sum(1)?;
+    let sum_mask = attention_mask_3d.sum(1)?;
     let embeddings = embeddings.broadcast_div(&sum_mask)?;
 
     // normalization
