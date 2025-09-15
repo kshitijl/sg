@@ -1,10 +1,9 @@
-use candle_core::{D, Device, IndexOp, Module, Result, Tensor};
-use candle_nn::{Activation, Dropout, Linear, VarBuilder, linear}; // <-- ADDED Activation
+use candle_core::{Device, IndexOp, Module, Result, Tensor};
+use candle_nn::{Dropout, Linear, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use hf_hub::api::tokio::Api;
+use hf_hub::api::sync::Api as HfApi;
 use tokenizers::Tokenizer;
 
-// This struct now only needs the dense layer
 pub struct BertPooler {
     dense: Linear,
 }
@@ -19,13 +18,12 @@ impl BertPooler {
 impl Module for BertPooler {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = self.dense.forward(xs)?;
-        // Call .tanh() directly on the tensor
         xs.tanh()
     }
 }
 pub struct CrossEncoder {
     bert: BertModel,
-    pooler: BertPooler, // <-- ADDED
+    pooler: BertPooler,
     dropout: Dropout,
     classifier: Linear,
     tokenizer: Tokenizer,
@@ -34,23 +32,20 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
-    pub async fn new(model_name: &str) -> Result<Self> {
-        let device = Device::Cpu; // Change to Device::new_cuda(0)? for GPU
+    pub fn new(model_name: &str) -> Result<Self> {
+        let device = Device::Cpu;
 
-        let api = Api::new().map_err(|e| candle_core::Error::Msg(format!("API error: {}", e)))?;
+        let api = HfApi::new().map_err(|e| candle_core::Error::Msg(format!("API error: {}", e)))?;
         let repo = api.model(model_name.to_string());
 
         let tokenizer_filename = repo
             .get("tokenizer.json")
-            .await
             .map_err(|e| candle_core::Error::Msg(format!("Failed to download tokenizer: {}", e)))?;
         let config_filename = repo
             .get("config.json")
-            .await
             .map_err(|e| candle_core::Error::Msg(format!("Failed to download config: {}", e)))?;
         let weights_filename = repo
             .get("model.safetensors")
-            .await
             .map_err(|e| candle_core::Error::Msg(format!("Failed to download weights: {}", e)))?;
 
         let tokenizer = Tokenizer::from_file(tokenizer_filename)
@@ -63,21 +58,17 @@ impl CrossEncoder {
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)? };
 
-        // --- CHANGED SECTION START ---
-        // Correctly partition the VarBuilder to load sub-modules
         let bert = BertModel::load(vb.pp("bert"), &config)?;
         let pooler = BertPooler::load(vb.pp("bert.pooler"), &config)?;
         let classifier = linear(config.hidden_size, 1, vb.pp("classifier"))?;
-        // --- CHANGED SECTION END ---
 
-        // Use dropout prob from config
         let dropout = Dropout::new(config.hidden_dropout_prob as f32);
 
         let max_length = 512;
 
         Ok(Self {
             bert,
-            pooler, // <-- ADDED
+            pooler,
             dropout,
             classifier,
             tokenizer,
@@ -86,10 +77,9 @@ impl CrossEncoder {
         })
     }
 
-    // ... predict() and rank() methods remain unchanged ...
     pub fn predict(&self, pairs: &[(&str, &str)]) -> Result<Vec<f32>> {
-        // This function can be batched for better performance, but for debugging, one by one is fine.
         let mut scores = Vec::with_capacity(pairs.len());
+        // TODO: batch
         for (query, passage) in pairs {
             let score = self.predict_pair(query, passage)?;
             scores.push(score);
@@ -120,24 +110,18 @@ impl CrossEncoder {
             .bert
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
-        // --- CHANGED SECTION START ---
-        // Get CLS token and pass it through the pooler
         let cls_output = bert_output.i((.., 0))?; // Use '..' to keep the batch dim
         let pooled_output = self.pooler.forward(&cls_output)?;
 
-        // Apply dropout (in eval mode, this is a no-op)
         let dropped = self.dropout.forward(&pooled_output, false)?;
 
-        // Apply classification head
         let logits = self.classifier.forward(&dropped)?;
-        // --- CHANGED SECTION END ---
 
         let score = logits.squeeze(0)?.squeeze(0)?.to_scalar::<f32>()?;
 
         Ok(score)
     }
 
-    // ... rank() method is also unchanged
     pub fn rank(
         &self,
         query: &str,
@@ -174,14 +158,11 @@ pub struct RankResult {
     pub text: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize the cross-encoder model
+fn main() -> Result<()> {
     println!("Loading cross-encoder model...");
-    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2").await?;
+    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2")?;
     println!("Model loaded successfully!");
 
-    // Test data - same as the Python example
     let query = "How many people live in Berlin?";
     let passages = [
         "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
@@ -209,4 +190,56 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! assert_float_eq {
+        ($left:expr, $right:expr, $eps:expr) => {{
+            let (left, right, eps) = ($left, $right, $eps);
+            let diff = (left - right).abs();
+            if diff > eps {
+                panic!(
+                    r#"assertion failed: `(left ≈ right)`
+  left: `{:?}`,
+ right: `{:?}`,
+  diff: `{:?}`,
+   eps: `{:?}`"#,
+                    left, right, diff, eps
+                );
+            }
+        }};
+    }
+
+    fn cross_encoder(eps: f32) {
+        let query = "How many people live in Berlin?";
+        let passages = [
+            "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+            "Berlin has a yearly total of about 135 million day visitors, making it one of the most-visited cities in the European Union.",
+            "In 2013 around 600,000 Berliners were registered in one of the more than 2,300 sport and fitness clubs.",
+        ];
+        let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
+
+        let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2").unwrap();
+        let scores = model.predict(&pairs).unwrap();
+
+        let python_answer: [f32; _] = [8.607141, 5.5062656, 6.3529854];
+
+        for (rust_answer, python_answer) in scores.iter().zip(python_answer) {
+            assert_float_eq!(rust_answer, python_answer, eps);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cross_encoder_not_that_close() {
+        cross_encoder(1e-9);
+    }
+
+    #[test]
+    fn test_cross_encoder_close() {
+        cross_encoder(1e-6);
+    }
 }

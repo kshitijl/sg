@@ -2441,7 +2441,6 @@ dependencies = [
  "safetensors 0.6.2",
  "serde_json",
  "tokenizers",
- "tokio",
  "twox-hash",
  "walkdir",
 ]
