@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "accelerate-src"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "415ed64958754dbe991900f3940677e6a7eefb4d7367afd70d642677b0c7d19d"
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -179,11 +185,13 @@ name = "candle-core"
 version = "0.9.1"
 source = "git+https://github.com/huggingface/candle.git#41a674ce8d1e37a9f8c6a97ff758552eddfd389a"
 dependencies = [
+ "accelerate-src",
  "byteorder",
  "candle-metal-kernels",
  "float8",
  "gemm 0.17.1",
  "half",
+ "libc",
  "memmap2",
  "num-traits",
  "num_cpus",
@@ -219,6 +227,7 @@ name = "candle-nn"
 version = "0.9.1"
 source = "git+https://github.com/huggingface/candle.git#41a674ce8d1e37a9f8c6a97ff758552eddfd389a"
 dependencies = [
+ "accelerate-src",
  "candle-core",
  "candle-metal-kernels",
  "half",
@@ -236,6 +245,7 @@ name = "candle-transformers"
 version = "0.9.1"
 source = "git+https://github.com/huggingface/candle.git#41a674ce8d1e37a9f8c6a97ff758552eddfd389a"
 dependencies = [
+ "accelerate-src",
  "byteorder",
  "candle-core",
  "candle-nn",

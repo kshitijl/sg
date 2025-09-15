@@ -1,9 +1,7 @@
 use anyhow::{Error as E, Result};
 use candle_core::{Device, IndexOp, Tensor};
-use candle_transformers::models::{
-    bert::{BertModel, Config, DTYPE},
-    mimi::candle_nn,
-};
+use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use candle_transformers::models::mimi::candle_nn;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use serde_json;
 use tokenizers::Tokenizer;
@@ -12,8 +10,7 @@ fn main() -> Result<()> {
     let device = if candle_core::utils::cuda_is_available() {
         Device::new_cuda(0)?
     } else if candle_core::utils::metal_is_available() {
-        // Device::new_metal(0)?
-        Device::Cpu
+        Device::new_metal(0)?
     } else {
         Device::Cpu
     };
@@ -91,6 +88,10 @@ fn main() -> Result<()> {
     let token_type_ids = token_ids.zeros_like()?;
 
     // 3. Get embeddings using the correct 2D attention mask.
+    for i in 0..10000 {
+        let embeddings = model.forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
+    }
+
     let embeddings = model.forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
     println!("Embeddings shape: {:?}", embeddings.dims());
 

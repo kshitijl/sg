@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["metal"] }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["metal"] }
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["metal", "accelerate"] }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["metal", "accelerate"] }
 hf-hub = "0.4.3"
 serde_json = "1.0.145"
 tokenizers = "0.22.0"
