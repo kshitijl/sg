@@ -3,6 +3,7 @@ use candle_core::{Device, IndexOp, Tensor};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::mimi::candle_nn;
 use hf_hub::{Repo, RepoType, api::sync::Api};
+use safetensors;
 use serde_json;
 use tokenizers::Tokenizer;
 
