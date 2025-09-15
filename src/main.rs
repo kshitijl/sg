@@ -1,124 +1,212 @@
-use anyhow::{Error as E, Result};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{D, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::{Activation, Dropout, Linear, VarBuilder, linear}; // <-- ADDED Activation
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use candle_transformers::models::mimi::candle_nn;
-use hf_hub::{Repo, RepoType, api::sync::Api};
-use safetensors;
-use serde_json;
+use hf_hub::api::tokio::Api;
 use tokenizers::Tokenizer;
 
-fn main() -> Result<()> {
-    let device = if candle_core::utils::cuda_is_available() {
-        Device::new_cuda(0)?
-    } else if candle_core::utils::metal_is_available() {
-        Device::new_metal(0)?
-    } else {
-        Device::Cpu
-    };
+// This struct now only needs the dense layer
+pub struct BertPooler {
+    dense: Linear,
+}
 
-    println!("Using device {:?}", device);
+impl BertPooler {
+    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let dense = linear(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
+        Ok(Self { dense })
+    }
+}
 
-    let api = Api::new()?;
-    let repo = api.repo(Repo::with_revision(
-        "sentence-transformers/all-MiniLM-L6-v2".to_string(),
-        RepoType::Model,
-        "ea78891063587eb050ed4166b20062eaf978037c".to_string(),
-    ));
-    let config_filename = repo.get("config.json")?;
-    let tokenizer_filename = repo.get("tokenizer.json")?;
-    let weights_filename = repo.get("model.safetensors")?;
+impl Module for BertPooler {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.dense.forward(xs)?;
+        // Call .tanh() directly on the tensor
+        xs.tanh()
+    }
+}
+pub struct CrossEncoder {
+    bert: BertModel,
+    pooler: BertPooler, // <-- ADDED
+    dropout: Dropout,
+    classifier: Linear,
+    tokenizer: Tokenizer,
+    device: Device,
+    max_length: usize,
+}
 
-    let config = std::fs::read_to_string(config_filename)?;
-    let config: Config = serde_json::from_str(&config)?;
-    let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+impl CrossEncoder {
+    pub async fn new(model_name: &str) -> Result<Self> {
+        let device = Device::Cpu; // Change to Device::new_cuda(0)? for GPU
 
-    let vb = unsafe {
-        candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)?
-    };
-    let model = BertModel::load(vb, &config)?;
+        let api = Api::new().map_err(|e| candle_core::Error::Msg(format!("API error: {}", e)))?;
+        let repo = api.model(model_name.to_string());
 
-    let sentences = [
-        "The weather is lovely today.",
-        "It's so sunny outside!",
-        "He drove to the stadium.",
+        let tokenizer_filename = repo
+            .get("tokenizer.json")
+            .await
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to download tokenizer: {}", e)))?;
+        let config_filename = repo
+            .get("config.json")
+            .await
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to download config: {}", e)))?;
+        let weights_filename = repo
+            .get("model.safetensors")
+            .await
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to download weights: {}", e)))?;
+
+        let tokenizer = Tokenizer::from_file(tokenizer_filename)
+            .map_err(|e| candle_core::Error::Msg(format!("Tokenizer error: {}", e)))?;
+        let config_content = std::fs::read(&config_filename)
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to read config: {}", e)))?;
+        let config: Config = serde_json::from_slice(&config_content)
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to parse config: {}", e)))?;
+
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)? };
+
+        // --- CHANGED SECTION START ---
+        // Correctly partition the VarBuilder to load sub-modules
+        let bert = BertModel::load(vb.pp("bert"), &config)?;
+        let pooler = BertPooler::load(vb.pp("bert.pooler"), &config)?;
+        let classifier = linear(config.hidden_size, 1, vb.pp("classifier"))?;
+        // --- CHANGED SECTION END ---
+
+        // Use dropout prob from config
+        let dropout = Dropout::new(config.hidden_dropout_prob as f32);
+
+        let max_length = 512;
+
+        Ok(Self {
+            bert,
+            pooler, // <-- ADDED
+            dropout,
+            classifier,
+            tokenizer,
+            device,
+            max_length,
+        })
+    }
+
+    // ... predict() and rank() methods remain unchanged ...
+    pub fn predict(&self, pairs: &[(&str, &str)]) -> Result<Vec<f32>> {
+        // This function can be batched for better performance, but for debugging, one by one is fine.
+        let mut scores = Vec::with_capacity(pairs.len());
+        for (query, passage) in pairs {
+            let score = self.predict_pair(query, passage)?;
+            scores.push(score);
+        }
+        Ok(scores)
+    }
+
+    fn predict_pair(&self, query: &str, passage: &str) -> Result<f32> {
+        let encoding = self
+            .tokenizer
+            .encode((query, passage), true)
+            .map_err(|e| candle_core::Error::Msg(format!("Tokenization error: {}", e)))?;
+
+        let tokens = encoding.get_ids();
+        let attention_mask = encoding.get_attention_mask();
+        let type_ids = encoding.get_type_ids();
+
+        let max_len = std::cmp::min(tokens.len(), self.max_length);
+        let tokens = &tokens[..max_len];
+        let attention_mask = &attention_mask[..max_len];
+        let type_ids = &type_ids[..max_len];
+
+        let input_ids = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+        let attention_mask = Tensor::new(attention_mask, &self.device)?.unsqueeze(0)?;
+        let token_type_ids = Tensor::new(type_ids, &self.device)?.unsqueeze(0)?;
+
+        let bert_output = self
+            .bert
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+
+        // --- CHANGED SECTION START ---
+        // Get CLS token and pass it through the pooler
+        let cls_output = bert_output.i((.., 0))?; // Use '..' to keep the batch dim
+        let pooled_output = self.pooler.forward(&cls_output)?;
+
+        // Apply dropout (in eval mode, this is a no-op)
+        let dropped = self.dropout.forward(&pooled_output, false)?;
+
+        // Apply classification head
+        let logits = self.classifier.forward(&dropped)?;
+        // --- CHANGED SECTION END ---
+
+        let score = logits.squeeze(0)?.squeeze(0)?.to_scalar::<f32>()?;
+
+        Ok(score)
+    }
+
+    // ... rank() method is also unchanged
+    pub fn rank(
+        &self,
+        query: &str,
+        passages: &[&str],
+        return_documents: bool,
+    ) -> Result<Vec<RankResult>> {
+        let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
+        let scores = self.predict(&pairs)?;
+
+        let mut results: Vec<RankResult> = scores
+            .into_iter()
+            .enumerate()
+            .map(|(idx, score)| RankResult {
+                corpus_id: idx,
+                score,
+                text: if return_documents {
+                    Some(passages[idx].to_string())
+                } else {
+                    None
+                },
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        Ok(results)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RankResult {
+    pub corpus_id: usize,
+    pub score: f32,
+    pub text: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize the cross-encoder model
+    println!("Loading cross-encoder model...");
+    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2").await?;
+    println!("Model loaded successfully!");
+
+    // Test data - same as the Python example
+    let query = "How many people live in Berlin?";
+    let passages = [
+        "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+        "Berlin has a yearly total of about 135 million day visitors, making it one of the most-visited cities in the European Union.",
+        "In 2013 around 600,000 Berliners were registered in one of the more than 2,300 sport and fitness clubs.",
     ];
 
-    // tokenize
+    println!("\n=== Predicting Scores ===");
+    let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
+    let scores = model.predict(&pairs)?;
 
-    if let Some(pp) = tokenizer.get_padding_mut() {
-        pp.strategy = tokenizers::PaddingStrategy::BatchLongest;
-        pp.pad_to_multiple_of = None;
+    println!("Scores: {:?}", scores);
+
+    println!("\n=== Ranking Passages ===");
+    let ranks = model.rank(query, &passages, true)?;
+
+    println!("Query: {}", query);
+    for rank in &ranks {
+        println!(
+            "- #{} ({:.2}): {}",
+            rank.corpus_id,
+            rank.score,
+            rank.text.as_ref().unwrap()
+        );
     }
 
-    if let Some(tp) = tokenizer.get_truncation_mut() {
-        tp.max_length = 512;
-        tp.strategy = tokenizers::TruncationStrategy::LongestFirst;
-    }
-    let tokens = tokenizer
-        .encode_batch(
-            sentences.to_vec(),
-            true, // add_special_tokens
-        )
-        .map_err(E::msg)?;
-
-    let token_ids = tokens
-        .iter()
-        .map(|tokens| {
-            let tokens = tokens.get_ids().to_vec();
-            Ok(Tensor::new(tokens.as_slice(), &device)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let token_ids = Tensor::stack(&token_ids, 0)?;
-    println!("Token ids: {}", token_ids.to_string());
-
-    // --- START: The Fix ---
-
-    // 1. Create the 2D attention mask from the tokenizer output.
-    let attention_masks_2d_vec: Vec<Tensor> = tokens
-        .iter()
-        .map(|tokens| {
-            // get_attention_mask() returns u32, which is what Tensor::new expects
-            let mask = tokens.get_attention_mask().to_vec();
-            Tensor::new(mask.as_slice(), &device).map_err(E::msg)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let attention_mask_2d = Tensor::stack(&attention_masks_2d_vec, 0)?;
-
-    // 2. The `token_type_ids` are all zeros for single sentences.
-    let token_type_ids = token_ids.zeros_like()?;
-
-    // 3. Get embeddings using the correct 2D attention mask.
-    for i in 0..10000 {
-        let embeddings = model.forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
-    }
-
-    let embeddings = model.forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
-    println!("Embeddings shape: {:?}", embeddings.dims());
-
-    // 4. For pooling, create a 3D version of the mask.
-    let attention_mask_3d = attention_mask_2d.to_dtype(DTYPE)?.unsqueeze(2)?;
-
-    // --- END: The Fix ---
-    let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
-
-    // print first few dims
-    println!("CLS embedding shape: {:?}", cls_emb.dims());
-    println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
-    // pooling
-    let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
-    dbg!(b_size, n_tokens);
-
-    let embeddings = (embeddings.broadcast_mul(&attention_mask_3d))?.sum(1)?;
-    let sum_mask = attention_mask_3d.sum(1)?;
-    let embeddings = embeddings.broadcast_div(&sum_mask)?;
-
-    // normalization
-    let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(1)?.sqrt()?)?;
-
-    // pairwise similarity
-    let similarities = embeddings.matmul(&embeddings.t()?)?;
-
-    println!("Pairwise similarities: \n{}", similarities.to_string());
     Ok(())
 }

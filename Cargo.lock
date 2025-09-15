@@ -2434,12 +2434,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-nn",
  "candle-transformers",
  "hf-hub",
  "rusqlite",
  "safetensors 0.6.2",
  "serde_json",
  "tokenizers",
+ "tokio",
  "twox-hash",
  "walkdir",
 ]
