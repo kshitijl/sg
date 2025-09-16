@@ -1,3 +1,4 @@
 /target
 index.db
 embeddings.h5
+trace*.json
