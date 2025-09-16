@@ -3,10 +3,210 @@ use candle_core::{Device, IndexOp, Module as CandleModule, Tensor};
 use candle_nn::{Dropout, Linear, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::mimi::candle_nn;
+use clap::{Parser, Subcommand};
 use hf_hub::api::sync::Api as HfApi;
 use hf_hub::{Repo, RepoType};
+use jiff::Timestamp;
+use rusqlite::{Connection as SqlConnection, Name, Result as SqlResult, params};
 use serde_json;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokenizers::Tokenizer;
+use tracing::{info, info_span, instrument};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use twox_hash::XxHash3_64;
+use walkdir::{DirEntry, WalkDir};
+
+static SKIP_DIRS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+fn is_hidden(s: &str) -> bool {
+    s.starts_with(".") && s != "." && s != ".."
+}
+
+fn should_skip_dir(dir: &DirEntry) -> bool {
+    let skip_dirs = SKIP_DIRS.get_or_init(|| {
+        let dirs = [
+            ".git",
+            ".venv",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            "target",
+            "build",
+            "dist",
+        ];
+        let answer = HashSet::from(dirs);
+        answer
+    });
+
+    dir.file_name()
+        .to_str()
+        .map(|s| is_hidden(s) || skip_dirs.contains(s))
+        .unwrap_or(false)
+}
+
+static SKIP_EXTS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+fn should_skip_ext(ext: &str) -> bool {
+    let skip_exts = SKIP_EXTS.get_or_init(|| {
+        let exts = [
+            "pyc", "pyo", "webp", "so", "dylib", "dll", "exe", "bin", "jpg", "jpeg", "png", "gif",
+            "h5", "pdf", "zip", "tar", "gz",
+        ];
+        let answer = HashSet::from(exts);
+        answer
+    });
+
+    skip_exts.contains(ext)
+}
+
+fn should_skip_file(path: &Path) -> bool {
+    // don't check whether path is a file to avoid a syscall. I'm okay accepting
+    // incorrect behavior in weird cases where a directory is named "foo.png"
+    // and we skip it in order to do better on the common case where there are
+    // directories with thousands of .png files.
+    return path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(should_skip_ext)
+        .unwrap_or(false);
+}
+
+fn should_skip(entry: &DirEntry) -> bool {
+    should_skip_dir(entry) || should_skip_file(entry.path())
+}
+
+struct FileInfo {
+    path: PathBuf,
+    mtime: Timestamp,
+    hash: u64,
+}
+
+struct FileId(usize);
+
+struct Chunk {
+    file: FileId,
+    start_byte: usize,
+    end_byte: usize,
+    text: String,
+    hash: u64,
+}
+
+fn hash_content(content: &str) -> u64 {
+    XxHash3_64::oneshot(content.as_bytes())
+}
+
+// TODO file cache should maybe mmap files rather than read them
+// TODO cpu embedder vs gpu embedder. or one for querying one for indexing
+struct AppState {
+    embedder: SentenceTransformer,
+    cross_encoder: CrossEncoder,
+    conn: SqlConnection,
+    // embeddings: Tensor
+    // file_cache: maybe Str -> mmap'd file descriptors at some point?
+    // for now str -> str map
+}
+
+impl AppState {
+    #[instrument]
+    fn new() -> Result<Self> {
+        // This is cheap and correct to clone because the GPU buffers and
+        // command queues are in Arcs.
+        let metal = Device::new_metal(0)?;
+        let embedder =
+            SentenceTransformer::new("sentence-transformers/all-MiniLM-L6-v2", metal.clone())?;
+        let cross_encoder = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", metal)?;
+        let conn = SqlConnection::open("index.db")?;
+
+        Ok(Self {
+            embedder,
+            cross_encoder,
+            conn,
+        })
+    }
+
+    #[instrument(skip_all)]
+    fn create_index(&mut self, directory: &str, batch_size: usize) -> Result<()> {
+        let max_tokens = self.embedder.max_length();
+
+        let mut all_files: Vec<FileInfo> = Vec::new();
+        let mut all_chunks: Vec<Chunk> = Vec::new();
+
+        for entry in WalkDir::new(directory)
+            .follow_links(true)
+            .into_iter()
+            .filter_entry(|e| !should_skip(e))
+        {
+            if entry.is_err() {
+                tracing::error!("Skipping error dir {:?}", entry);
+                continue;
+            }
+            let entry = entry.unwrap();
+
+            println!("{}", entry.path().display());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Parser, Debug)]
+struct Args {
+    /// The directory to index
+    dir: String,
+}
+
+fn main() -> Result<()> {
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::{prelude::*, registry::Registry};
+
+    let args = Args::parse();
+
+    let (chrome_layer, _guard) = ChromeLayerBuilder::new().build();
+    tracing_subscriber::registry()
+        .with(chrome_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+
+    println!("Loading cross-encoder model...");
+    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", Device::Cpu)?;
+    println!("Model loaded successfully!");
+
+    let query = "How many people live in Berlin?";
+    let passages = [
+        "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+        "Berlin has a yearly total of about 135 million day visitors, making it one of the most-visited cities in the European Union.",
+        "In 2013 around 600,000 Berliners were registered in one of the more than 2,300 sport and fitness clubs.",
+    ];
+
+    println!("\n=== Predicting Scores ===");
+    let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
+    let scores = model.predict(&pairs)?;
+
+    println!("Scores: {:?}", scores);
+
+    println!("\n=== Ranking Passages ===");
+    let ranks = model.rank(query, &passages, true)?;
+
+    println!("Query: {}", query);
+    for rank in &ranks {
+        println!(
+            "- #{} ({:.2}): {}",
+            rank.corpus_id,
+            rank.score,
+            rank.text.as_ref().unwrap()
+        );
+    }
+
+    let mut app = AppState::new()?;
+    dbg!("fdw");
+    app.create_index(args.dir.as_str(), 128)?;
+
+    dbg!("ff");
+    Ok(())
+}
 
 struct SentenceTransformer {
     bert: BertModel,
@@ -47,6 +247,10 @@ impl SentenceTransformer {
             bert: model,
             device,
         })
+    }
+
+    fn max_length(&self) -> usize {
+        self.tokenizer.get_truncation().unwrap().max_length
     }
 
     fn embed(&self, sentences: &[&str]) -> Result<Tensor> {
@@ -260,43 +464,28 @@ pub struct RankResult {
     pub text: Option<String>,
 }
 
-fn main() -> Result<()> {
-    println!("Loading cross-encoder model...");
-    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", Device::Cpu)?;
-    println!("Model loaded successfully!");
-
-    let query = "How many people live in Berlin?";
-    let passages = [
-        "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
-        "Berlin has a yearly total of about 135 million day visitors, making it one of the most-visited cities in the European Union.",
-        "In 2013 around 600,000 Berliners were registered in one of the more than 2,300 sport and fitness clubs.",
-    ];
-
-    println!("\n=== Predicting Scores ===");
-    let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
-    let scores = model.predict(&pairs)?;
-
-    println!("Scores: {:?}", scores);
-
-    println!("\n=== Ranking Passages ===");
-    let ranks = model.rank(query, &passages, true)?;
-
-    println!("Query: {}", query);
-    for rank in &ranks {
-        println!(
-            "- #{} ({:.2}): {}",
-            rank.corpus_id,
-            rank.score,
-            rank.text.as_ref().unwrap()
-        );
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_should_skip_ext() {
+        assert_eq!(should_skip_ext("pyc"), true);
+    }
+
+    #[test]
+    fn test_should_skip_file() {
+        assert_eq!(should_skip_file(Path::new("foo.txt")), false);
+        assert_eq!(should_skip_file(Path::new("foo.pyc")), true);
+        assert_eq!(should_skip_file(Path::new("foo.exe")), true);
+        assert_eq!(should_skip_file(Path::new("foo.")), false);
+        assert_eq!(should_skip_file(Path::new("foo")), false);
+        assert_eq!(should_skip_file(Path::new(".foo")), false);
+        assert_eq!(should_skip_file(Path::new(".foo.txt")), false);
+        assert_eq!(should_skip_file(Path::new(".foo.pyc")), true);
+        assert_eq!(should_skip_file(Path::new("foo.tar.gz")), true);
+        assert_eq!(should_skip_file(Path::new("foo.megalong")), false);
+    }
 
     macro_rules! assert_float_eq {
         ($left:expr, $right:expr, $eps:expr) => {{
