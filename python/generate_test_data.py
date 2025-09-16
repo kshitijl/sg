@@ -24,6 +24,7 @@ print(embeddings.shape)
 # 3. Calculate the embedding similarities
 similarities = model.similarity(embeddings, embeddings)
 print(similarities)
+print(f"{similarities[0, 1]:.6f} {similarities[0, 2]:.6f} {similarities[1, 2]:.6f}")
 
 tok = AutoTokenizer.from_pretrained(
     "sentence-transformers/all-MiniLM-L6-v2",

@@ -1,10 +1,114 @@
-use candle_core::{Device, IndexOp, Module, Result, Tensor};
+use anyhow::{Error as E, Result};
+use candle_core::{Device, IndexOp, Module as CandleModule, Tensor};
 use candle_nn::{Dropout, Linear, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use candle_transformers::models::mimi::candle_nn;
 use hf_hub::api::sync::Api as HfApi;
+use hf_hub::{Repo, RepoType};
+use serde_json;
 use tokenizers::Tokenizer;
 
-pub struct BertPooler {
+struct SentenceTransformer {
+    bert: BertModel,
+    device: Device,
+    tokenizer: Tokenizer,
+}
+
+impl SentenceTransformer {
+    fn new(model_name: &str, device: Device) -> Result<Self> {
+        let api = HfApi::new()?;
+        let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+        let config_filename = repo.get("config.json")?;
+        let tokenizer_filename = repo.get("tokenizer.json")?;
+        let weights_filename = repo.get("model.safetensors")?;
+
+        let config = std::fs::read_to_string(config_filename)?;
+        let config: Config = serde_json::from_str(&config)?;
+
+        let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)?
+        };
+        let model = BertModel::load(vb, &config)?;
+
+        if let Some(pp) = tokenizer.get_padding_mut() {
+            pp.strategy = tokenizers::PaddingStrategy::BatchLongest;
+            pp.pad_to_multiple_of = None;
+        }
+
+        if let Some(tp) = tokenizer.get_truncation_mut() {
+            tp.max_length = 512;
+            tp.strategy = tokenizers::TruncationStrategy::LongestFirst;
+        }
+
+        Ok(Self {
+            tokenizer,
+            bert: model,
+            device,
+        })
+    }
+
+    fn embed(&self, sentences: &[&str]) -> Result<Tensor> {
+        let tokens = self
+            .tokenizer
+            .encode_batch(
+                sentences.to_vec(),
+                true, // add_special_tokens
+            )
+            .map_err(E::msg)?;
+
+        let token_ids = tokens
+            .iter()
+            .map(|tokens| {
+                let tokens = tokens.get_ids().to_vec();
+                Ok(Tensor::new(tokens.as_slice(), &self.device)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let token_ids = Tensor::stack(&token_ids, 0)?;
+
+        let attention_masks_2d_vec: Vec<Tensor> = tokens
+            .iter()
+            .map(|tokens| {
+                // get_attention_mask() returns u32, which is what Tensor::new expects
+                let mask = tokens.get_attention_mask().to_vec();
+                Tensor::new(mask.as_slice(), &self.device).map_err(E::msg)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let attention_mask_2d = Tensor::stack(&attention_masks_2d_vec, 0)?;
+
+        // 2. The `token_type_ids` are all zeros for single sentences.
+        let token_type_ids = token_ids.zeros_like()?;
+
+        // 3. Get embeddings using the correct 2D attention mask.
+        let embeddings =
+            self.bert
+                .forward(&token_ids, &token_type_ids, Some(&attention_mask_2d))?;
+        let attention_mask_3d = attention_mask_2d.to_dtype(DTYPE)?.unsqueeze(2)?;
+
+        // --- END: The Fix ---
+        let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
+
+        // print first few dims
+        println!("CLS embedding shape: {:?}", cls_emb.dims());
+        println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
+        // pooling
+        let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
+        dbg!(b_size, n_tokens);
+
+        let embeddings = (embeddings.broadcast_mul(&attention_mask_3d))?.sum(1)?;
+        let sum_mask = attention_mask_3d.sum(1)?;
+        let embeddings = embeddings.broadcast_div(&sum_mask)?;
+
+        // normalization
+        let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(1)?.sqrt()?)?;
+
+        Ok(embeddings)
+    }
+}
+
+struct BertPooler {
     dense: Linear,
 }
 
@@ -15,8 +119,8 @@ impl BertPooler {
     }
 }
 
-impl Module for BertPooler {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+impl CandleModule for BertPooler {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor, candle_core::Error> {
         let xs = self.dense.forward(xs)?;
         xs.tanh()
     }
@@ -32,9 +136,7 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
-    pub fn new(model_name: &str) -> Result<Self> {
-        let device = Device::Cpu;
-
+    pub fn new(model_name: &str, device: Device) -> Result<Self> {
         let api = HfApi::new().map_err(|e| candle_core::Error::Msg(format!("API error: {}", e)))?;
         let repo = api.model(model_name.to_string());
 
@@ -160,7 +262,7 @@ pub struct RankResult {
 
 fn main() -> Result<()> {
     println!("Loading cross-encoder model...");
-    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2")?;
+    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", Device::Cpu)?;
     println!("Model loaded successfully!");
 
     let query = "How many people live in Berlin?";
@@ -213,7 +315,7 @@ mod tests {
         }};
     }
 
-    fn cross_encoder(eps: f32) {
+    fn cross_encoder(device: Device) -> Vec<f32> {
         let query = "How many people live in Berlin?";
         let passages = [
             "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
@@ -222,24 +324,137 @@ mod tests {
         ];
         let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
 
-        let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2").unwrap();
-        let scores = model.predict(&pairs).unwrap();
+        let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", device).unwrap();
+        let rust_answers = model.predict(&pairs).unwrap();
 
-        let python_answer: [f32; _] = [8.607141, 5.5062656, 6.3529854];
+        rust_answers
+    }
 
-        for (rust_answer, python_answer) in scores.iter().zip(python_answer) {
+    fn cross_encoder_matches_python(device: Device, eps: f32) {
+        let rust_answers = cross_encoder(device);
+
+        let python_answers: [f32; _] = [8.607141, 5.5062656, 6.3529854];
+
+        for (rust_answer, python_answer) in rust_answers.iter().zip(python_answers) {
             assert_float_eq!(rust_answer, python_answer, eps);
         }
     }
 
-    #[test]
-    #[should_panic]
-    fn test_cross_encoder_not_that_close() {
-        cross_encoder(1e-9);
+    fn cross_encoder_devices_agree(device1: Device, device2: Device, eps: f32) {
+        let device1_answers = cross_encoder(device1);
+        let device2_answers = cross_encoder(device2);
+
+        for (device1_answer, device2_answer) in device1_answers.iter().zip(device2_answers) {
+            assert_float_eq!(device1_answer, device2_answer, eps);
+        }
+    }
+
+    fn metal() -> Device {
+        Device::new_metal(0).unwrap()
     }
 
     #[test]
-    fn test_cross_encoder_close() {
-        cross_encoder(1e-6);
+    fn test_cross_encoder_close_to_python_cpu() {
+        cross_encoder_matches_python(Device::Cpu, 1e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cross_encoder_not_that_close_to_python_cpu() {
+        cross_encoder_matches_python(Device::Cpu, 1e-7);
+    }
+
+    #[test]
+    fn test_cross_encoder_close_to_python_metal() {
+        cross_encoder_matches_python(metal(), 5e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cross_encoder_not_that_close_to_python_metal() {
+        cross_encoder_matches_python(metal(), 1e-7);
+    }
+
+    #[test]
+    fn test_cross_encoder_devices_close() {
+        cross_encoder_devices_agree(Device::Cpu, metal(), 5e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cross_encoder_devices_not_that_close() {
+        cross_encoder_devices_agree(Device::Cpu, metal(), 1e-7);
+    }
+
+    fn embeddings(device: Device) -> Vec<f32> {
+        let sentences = [
+            "The weather is lovely today.",
+            "It's so sunny outside!",
+            "He drove to the stadium.",
+        ];
+
+        let model =
+            SentenceTransformer::new("sentence-transformers/all-MiniLM-L6-v2", device).unwrap();
+        let embeddings: Tensor = model.embed(&sentences).unwrap();
+
+        let similarities = embeddings.matmul(&embeddings.t().unwrap()).unwrap();
+        let rust_answers: Vec<f32> = [(0, 1), (0, 2), (1, 2)]
+            .iter()
+            .map(|idx| similarities.i(*idx).unwrap().to_scalar::<f32>().unwrap())
+            .collect();
+
+        rust_answers
+    }
+
+    fn embeddings_matches_python(device: Device, eps: f32) {
+        let rust_answers = embeddings(device);
+
+        let python_answers: [f32; _] = [0.665955, 0.104584, 0.141145];
+
+        for (rust_answer, python_answer) in rust_answers.iter().zip(python_answers) {
+            assert_float_eq!(rust_answer, python_answer, eps);
+        }
+    }
+
+    fn embeddings_devices_agree(device1: Device, device2: Device, eps: f32) {
+        let device1_answers = embeddings(device1);
+        let device2_answers = embeddings(device2);
+
+        for (device1_answer, device2_answer) in device1_answers.iter().zip(device2_answers) {
+            assert_float_eq!(device1_answer, device2_answer, eps);
+        }
+    }
+
+    #[test]
+    fn test_embeddings_close_to_python_cpu() {
+        embeddings_matches_python(Device::Cpu, 1e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_embeddings_not_that_close_to_python_cpu() {
+        embeddings_matches_python(Device::Cpu, 1e-7);
+    }
+
+    #[test]
+    fn test_embeddings_close_to_python_metal() {
+        embeddings_matches_python(metal(), 5e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_embeddings_not_that_close_to_python_metal() {
+        embeddings_matches_python(metal(), 1e-7);
+    }
+
+    #[test]
+    fn test_embeddings_devices_close() {
+        embeddings_devices_agree(Device::Cpu, metal(), 5e-6);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_embeddings_devices_not_that_close() {
+        embeddings_devices_agree(Device::Cpu, metal(), 1e-7);
     }
 }
