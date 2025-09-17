@@ -6,15 +6,19 @@ use candle_transformers::models::mimi::candle_nn;
 use clap::{Parser, Subcommand};
 use hf_hub::api::sync::Api as HfApi;
 use hf_hub::{Repo, RepoType};
+use indicatif::{ProgressBar, ProgressStyle};
 use jiff::Timestamp;
 use rusqlite::{Connection as SqlConnection, Name, Result as SqlResult, params};
+use safetensors;
 use serde_json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 use tracing::{info, info_span, instrument};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_timing;
 use twox_hash::XxHash3_64;
 use walkdir::{DirEntry, WalkDir};
 
@@ -77,28 +81,36 @@ fn should_skip(entry: &DirEntry) -> bool {
     should_skip_dir(entry) || should_skip_file(entry.path())
 }
 
+struct HashOfStr(u64);
+
 struct FileInfo {
+    id: FileId,
     path: PathBuf,
     mtime: Timestamp,
-    hash: u64,
+    hash: HashOfStr,
 }
 
-struct FileId(usize);
+#[derive(Copy, Clone)]
+struct FileId(u64);
 
+#[derive(Clone, Copy, Debug)]
+struct ChunkRange {
+    start_byte: u64,
+    end_byte: u64,
+}
 struct Chunk {
     file: FileId,
-    start_byte: usize,
-    end_byte: usize,
     text: String,
-    hash: u64,
+    range: ChunkRange,
+    hash: HashOfStr,
 }
 
-fn hash_content(content: &str) -> u64 {
-    XxHash3_64::oneshot(content.as_bytes())
+fn hash_content(content: &str) -> HashOfStr {
+    HashOfStr(XxHash3_64::oneshot(content.as_bytes()))
 }
 
-// TODO file cache should maybe mmap files rather than read them
-// TODO cpu embedder vs gpu embedder. or one for querying one for indexing
+// TODO opt file cache should maybe mmap files rather than read them
+// TODO opt cpu embedder vs gpu embedder. or one for querying one for indexing
 struct AppState {
     embedder: SentenceTransformer,
     cross_encoder: CrossEncoder,
@@ -126,26 +138,225 @@ impl AppState {
         })
     }
 
+    fn chunk_text(content: &str, max_tokens: usize) -> Vec<ChunkRange> {
+        // TODO opt make this more precise. Probably what we can do is tokenize
+        // the whole thing using the embedding tokenizer, then take [max_tokens]
+        // at a time, and work backwards to figure out the text ranges. idk if
+        // the tokenizer supports that.
+
+        // TODO cor later error if truncation happened
+
+        // Rough estimate: 4 chars = 1 token
+        let max_chars = (max_tokens * 4 * 7) / 10;
+
+        let mut answer = Vec::new();
+        let mut this_chunk_start = 0;
+
+        let content = content.as_bytes();
+
+        while this_chunk_start < content.len() {
+            let mut this_chunk_end = this_chunk_start + max_chars;
+            if this_chunk_end >= content.len() {
+                answer.push(ChunkRange {
+                    start_byte: this_chunk_start as u64,
+                    end_byte: content.len() as u64,
+                });
+                break;
+            }
+
+            // Find last word boundary
+
+            // TODO cor this doesn't handle UTF-8 properly
+            while this_chunk_end > this_chunk_start
+                && !content[this_chunk_end as usize].is_ascii_whitespace()
+            {
+                this_chunk_end -= 1;
+            }
+
+            // If no space found, just cut at max_chars
+            if this_chunk_end == this_chunk_start {
+                this_chunk_end = this_chunk_start + max_chars;
+            }
+
+            answer.push(ChunkRange {
+                start_byte: this_chunk_start as u64,
+                end_byte: this_chunk_end as u64,
+            });
+
+            this_chunk_start = this_chunk_end;
+
+            // Skip whitespace
+            while this_chunk_start < content.len()
+                && content[this_chunk_start].is_ascii_whitespace()
+            {
+                this_chunk_start += 1;
+            }
+        }
+
+        tracing::info!("{:?}", answer);
+        answer
+    }
+
+    fn process_file(
+        entry: DirEntry,
+        max_tokens: usize,
+        file_id: FileId,
+    ) -> Result<(FileInfo, Vec<Chunk>)> {
+        let file_mtime = entry.metadata().map_err(E::msg)?.modified()?;
+        let file_mtime = jiff::Timestamp::try_from(file_mtime)?;
+        // TODO cor deal with non-UTF binary files
+        let content = std::fs::read_to_string(entry.path())?;
+        let file_hash = hash_content(&content);
+        let file_info = FileInfo {
+            id: file_id,
+            path: entry.into_path(),
+            mtime: file_mtime,
+            hash: file_hash,
+        };
+
+        let chunk_ranges = Self::chunk_text(&content, max_tokens);
+
+        // TODO qual to more cool stuff here
+        let filewide_tags = if let Some(filename) = file_info.path.file_name() {
+            format!("Tags: {}. Content: ", filename.display())
+        } else {
+            "".to_string()
+        };
+
+        let mut answer = Vec::new();
+
+        let content = content.as_bytes();
+        for (chunk_idx, chunk_range) in chunk_ranges.iter().enumerate() {
+            let original_text =
+                &content[chunk_range.start_byte as usize..chunk_range.end_byte as usize];
+            let embed_text = filewide_tags.clone() + &String::from_utf8_lossy(original_text);
+
+            let hash = hash_content(&embed_text);
+
+            let chunk = Chunk {
+                file: file_id,
+                text: embed_text,
+                range: *chunk_range,
+                hash,
+            };
+
+            answer.push(chunk);
+        }
+
+        Ok((file_info, answer))
+    }
+
+    #[instrument(skip_all)]
+    fn write_embeddings(embeddings: Tensor, model_name: &str, path: &Path) -> Result<()> {
+        let mut metadata = HashMap::new();
+        metadata.insert("model_name".to_string(), model_name.to_string());
+        // TODO put other metadata like creation time and sg version number
+        let mut tensors = HashMap::new();
+        tensors.insert("embeddings".to_string(), embeddings);
+        safetensors::serialize_to_file(tensors, &Some(metadata), path)?;
+
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     fn create_index(&mut self, directory: &str, batch_size: usize) -> Result<()> {
+        // TODO opt tokenize metadata/tags just once
+        // TODO opt tokenize the whole document, then create chunks of exactly the
+        // right size
         let max_tokens = self.embedder.max_length();
 
         let mut all_files: Vec<FileInfo> = Vec::new();
         let mut all_chunks: Vec<Chunk> = Vec::new();
 
-        for entry in WalkDir::new(directory)
+        for (file_idx, entry) in WalkDir::new(directory)
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| !should_skip(e))
+            .enumerate()
         {
-            if entry.is_err() {
-                tracing::error!("Skipping error dir {:?}", entry);
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::error!("Skipping error dir {:?}", e);
+                    continue;
+                }
+            };
+
+            if entry.path().is_dir() {
                 continue;
             }
-            let entry = entry.unwrap();
 
-            println!("{}", entry.path().display());
+            let filename_for_print = entry.clone();
+            let (file_info, mut chunks) =
+                Self::process_file(entry, max_tokens, FileId(file_idx as u64))?;
+            tracing::info!(
+                "File {} with {} chunks",
+                filename_for_print.file_name().display(),
+                chunks.len()
+            );
+            all_files.push(file_info);
+            all_chunks.append(&mut chunks);
         }
+
+        let embeddings = {
+            let _span = tracing::info_span!(
+                "embedding batches",
+                total_files = all_files.len(),
+                total_chunks = all_chunks.len(),
+                batch_size = batch_size
+            );
+
+            let mut embeddings: Vec<Tensor> = Vec::new();
+
+            let pb = ProgressBar::new(all_chunks.len() as u64);
+            pb.set_style(
+    ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} batches ({eta})")
+        .unwrap()
+        .progress_chars("#>-")
+);
+            pb.set_position(0);
+            for (batch_idx, batch) in all_chunks.chunks(batch_size).enumerate() {
+                pb.set_message(format!("Batch {} chunks", batch.len()));
+                let chunk_texts: Vec<&str> = batch.iter().map(|x| x.text.as_str()).collect();
+                let batch_embeddings = self.embedder.embed(&chunk_texts)?;
+                embeddings.push(batch_embeddings);
+                pb.set_position(((batch_idx + 1) * batch_size) as u64);
+            }
+
+            pb.finish_with_message("Embedding complete!");
+            Tensor::cat(&embeddings, 0)?
+        };
+
+        Self::write_embeddings(
+            embeddings,
+            self.embedder.model_name(),
+            Path::new("embeddings.safetensors"),
+        )?;
+
+        // TODO corr add a keywords table and keyword_id in chunks
+        self.conn.execute_batch(
+            "
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY,
+                filename TEXT NOT NULL,
+                mtime REAL NOT NULL,
+                hash TEXT NOT NULL
+            );
+
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                matrix_index INTEGER NOT NULL,
+                FOREIGN KEY (file_id) REFERENCES files (id)
+            );
+
+            CREATE INDEX idx_chunks_matrix_index ON chunks(matrix_index);
+        ",
+        )?;
 
         Ok(())
     }
@@ -168,43 +379,15 @@ fn main() -> Result<()> {
         .with(chrome_layer)
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::from_default_env())
+        // .with(
+        //     tracing_timing::Builder::default()
+        //         .layer(|| tracing_timing::Histogram::new_with_max(1_000_000, 2).unwrap()),
+        // )
         .init();
 
-    println!("Loading cross-encoder model...");
-    let model = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", Device::Cpu)?;
-    println!("Model loaded successfully!");
-
-    let query = "How many people live in Berlin?";
-    let passages = [
-        "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
-        "Berlin has a yearly total of about 135 million day visitors, making it one of the most-visited cities in the European Union.",
-        "In 2013 around 600,000 Berliners were registered in one of the more than 2,300 sport and fitness clubs.",
-    ];
-
-    println!("\n=== Predicting Scores ===");
-    let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
-    let scores = model.predict(&pairs)?;
-
-    println!("Scores: {:?}", scores);
-
-    println!("\n=== Ranking Passages ===");
-    let ranks = model.rank(query, &passages, true)?;
-
-    println!("Query: {}", query);
-    for rank in &ranks {
-        println!(
-            "- #{} ({:.2}): {}",
-            rank.corpus_id,
-            rank.score,
-            rank.text.as_ref().unwrap()
-        );
-    }
-
     let mut app = AppState::new()?;
-    dbg!("fdw");
     app.create_index(args.dir.as_str(), 128)?;
 
-    dbg!("ff");
     Ok(())
 }
 
@@ -212,6 +395,7 @@ struct SentenceTransformer {
     bert: BertModel,
     device: Device,
     tokenizer: Tokenizer,
+    model_name: String,
 }
 
 impl SentenceTransformer {
@@ -246,7 +430,12 @@ impl SentenceTransformer {
             tokenizer,
             bert: model,
             device,
+            model_name: model_name.to_string(),
         })
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_name
     }
 
     fn max_length(&self) -> usize {
@@ -292,14 +481,14 @@ impl SentenceTransformer {
         let attention_mask_3d = attention_mask_2d.to_dtype(DTYPE)?.unsqueeze(2)?;
 
         // --- END: The Fix ---
-        let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
+        // let cls_emb = embeddings.i((0, 0))?; // shape: [hidden]
 
         // print first few dims
-        println!("CLS embedding shape: {:?}", cls_emb.dims());
-        println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
+        // println!("CLS embedding shape: {:?}", cls_emb.dims());
+        // println!("CLS embedding first 5 dims: {:?}", cls_emb.narrow(0, 0, 5)?);
         // pooling
-        let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
-        dbg!(b_size, n_tokens);
+        // let (b_size, n_tokens, _hidden) = embeddings.dims3()?;
+        // dbg!(b_size, n_tokens);
 
         let embeddings = (embeddings.broadcast_mul(&attention_mask_3d))?.sum(1)?;
         let sum_mask = attention_mask_3d.sum(1)?;

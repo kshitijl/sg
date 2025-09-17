@@ -182,20 +182,14 @@ def process_file(
         (start_byte, end_byte) = chunk_range
         text = content[start_byte:end_byte]
 
-        # Add filename to first chunk only
-        if chunk_idx == 0:
-            embed_text = f"File: {path.name}\n\n{text}"
-        else:
-            embed_text = text
+        embed_text = f"File: {path.name}\n\n{text}"
 
         chunk = Chunk(
-            file_id=file_id,  # Will be set later
+            file_id=file_id,
             start_byte=max(0, start_byte),
             end_byte=end_byte,
-            # embed with the additional possible filename in first chunk
             text=embed_text,
-            # hash the original text
-            hash=hash_content(text),
+            hash=hash_content(embed_text),
         )
         chunks.append(chunk)
 
