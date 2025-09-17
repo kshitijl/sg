@@ -4,6 +4,7 @@ use candle_nn::{Dropout, Linear, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::mimi::candle_nn;
 use clap::{Parser, Subcommand};
+use fastembed;
 use hf_hub::api::sync::Api as HfApi;
 use hf_hub::{Repo, RepoType};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -113,6 +114,7 @@ fn hash_content(content: &str) -> HashOfStr {
 // TODO opt cpu embedder vs gpu embedder. or one for querying one for indexing
 struct AppState {
     embedder: SentenceTransformer,
+    fastembedder: FastEmbedder,
     cross_encoder: CrossEncoder,
     conn: SqlConnection,
     // embeddings: Tensor
@@ -126,13 +128,17 @@ impl AppState {
         // This is cheap and correct to clone because the GPU buffers and
         // command queues are in Arcs.
         let metal = Device::new_metal(0)?;
+        //
+        // let metal = Device::Cpu;
         let embedder =
             SentenceTransformer::new("sentence-transformers/all-MiniLM-L6-v2", metal.clone())?;
+        let fastembedder = FastEmbedder::new()?;
         let cross_encoder = CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L6-v2", metal)?;
         let conn = SqlConnection::open("index.db")?;
 
         Ok(Self {
             embedder,
+            fastembedder,
             cross_encoder,
             conn,
         })
@@ -298,6 +304,12 @@ impl AppState {
             all_chunks.append(&mut chunks);
         }
 
+        tracing::info!(
+            "Found {} files and {} chunks",
+            all_files.len(),
+            all_chunks.len()
+        );
+
         let embeddings = {
             let _span = tracing::info_span!(
                 "embedding batches",
@@ -319,6 +331,16 @@ impl AppState {
             for (batch_idx, batch) in all_chunks.chunks(batch_size).enumerate() {
                 pb.set_message(format!("Batch {} chunks", batch.len()));
                 let chunk_texts: Vec<&str> = batch.iter().map(|x| x.text.as_str()).collect();
+                let num_texts = chunk_texts.len();
+                // let batch_embeddings = self.fastembedder.embed(chunk_texts)?;
+                // let flat_embeddings: Vec<f32> = batch_embeddings.into_iter().flatten().collect();
+                // let embeddings_dim = flat_embeddings.len() / num_texts;
+                // embeddings.push(Tensor::from_vec(
+                //     flat_embeddings,
+                //     (num_texts, embeddings_dim),
+                //     &Device::Cpu,
+                // )?);
+
                 let batch_embeddings = self.embedder.embed(&chunk_texts)?;
                 embeddings.push(batch_embeddings);
                 pb.set_position(((batch_idx + 1) * batch_size) as u64);
@@ -386,9 +408,52 @@ fn main() -> Result<()> {
         .init();
 
     let mut app = AppState::new()?;
-    app.create_index(args.dir.as_str(), 128)?;
+    app.create_index(args.dir.as_str(), 25)?;
 
     Ok(())
+}
+
+struct FastEmbedder {
+    model: fastembed::TextEmbedding,
+    max_length: usize,
+}
+
+impl FastEmbedder {
+    fn new() -> Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        use ort::execution_providers::{self, ExecutionProvider};
+        let ep = execution_providers::CoreMLExecutionProvider::default();
+
+        tracing::info!("EP available {:?}", ep.is_available());
+
+        let io = InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_execution_providers(vec![
+            execution_providers::ExecutionProviderDispatch::from(
+                execution_providers::CoreMLExecutionProvider::default()
+                    .with_compute_units(execution_providers::coreml::CoreMLComputeUnits::CPUAndGPU)
+                    .with_specialization_strategy(
+                        execution_providers::coreml::CoreMLSpecializationStrategy::FastPrediction,
+                    ),
+            ),
+            execution_providers::ExecutionProviderDispatch::from(
+                execution_providers::CPUExecutionProvider::default(),
+            ),
+        ]);
+
+        let model = TextEmbedding::try_new(io)?;
+
+        Ok(Self {
+            model,
+            max_length: 256,
+        })
+    }
+
+    fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    fn embed(&mut self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>> {
+        self.model.embed(texts, None)
+    }
 }
 
 struct SentenceTransformer {
@@ -422,7 +487,7 @@ impl SentenceTransformer {
         }
 
         if let Some(tp) = tokenizer.get_truncation_mut() {
-            tp.max_length = 512;
+            tp.max_length = 256;
             tp.strategy = tokenizers::TruncationStrategy::LongestFirst;
         }
 

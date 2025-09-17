@@ -22,3 +22,9 @@ tracing = "0.1.41"
 clap = { version = "4.5.47", features = ["derive"] }
 tracing-timing = "0.7.0"
 indicatif = "0.18.0"
+fastembed = "5.2.0"
+ort = {version = "2.0.0-rc.10", features=["coreml"]}
+
+
+[patch.crates-io]
+fastembed = { path = "./fastembed-rs" }
