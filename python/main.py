@@ -51,9 +51,10 @@ class AppState:
     conn: sqlite3.Connection
     embeddings: np.ndarray
     file_cache: Dict[str, str]
+    top_k: int
 
 
-def create_app_state() -> AppState:
+def create_app_state(top_k: int) -> AppState:
     # Get model name from embeddings file
     with h5py.File("embeddings.h5", "r") as f:
         model_name = f.attrs.get("model")
@@ -77,6 +78,7 @@ def create_app_state() -> AppState:
         embeddings=embeddings,
         conn=conn,
         file_cache={},
+        top_k=top_k,
     )
 
 
@@ -95,10 +97,13 @@ def file_content_from_cache(state: AppState, filepath: str) -> str:
 @dataclass
 class SearchResult:
     rank: int
-    similarity: float
+    bi_encoder_rank: int
+    bi_encoder_score: float
+    cross_encoder_score: float
     filename: str
     file_id: int
     chunk_content: str
+    embedded_chunk_text: str
     start_byte: int
     end_byte: int
 
@@ -136,36 +141,42 @@ def iter_files(directory: Path) -> Iterator[Path]:
                 yield path
 
 
-def chunk_text(text: str, max_tokens: int) -> List[Tuple[int, int]]:
-    # Rough estimate: 4 chars = 1 token
-    max_chars = int(max_tokens * 4 * 0.8)  # 80% of max size
+@dataclass
+class ChunkIndices:
+    start: int
+    end: int
 
-    chunks = []
+
+def merge_chunks(buncha_chunks: List[ChunkIndices]) -> ChunkIndices:
+    start = min([c.start for c in buncha_chunks])
+    end = max([c.end for c in buncha_chunks])
+
+    return ChunkIndices(start=start, end=end)
+
+
+def chunk_text(text: str, max_tokens: int) -> List[ChunkIndices]:
+    paragraph_chunks: List[ChunkIndices] = []
     start = 0
 
     while start < len(text):
-        end = start + max_chars
+        end = start + 1
 
-        if end >= len(text):
-            chunks.append((start, len(text)))
-            break
+        while end < len(text) and text[end : end + 2] != "\n\n":
+            end += 1
 
-        # Find last word boundary
-        while end > start and not text[end].isspace():
-            end -= 1
+        paragraph_chunks.append(ChunkIndices(start, end))
 
-        # If no space found, just cut at max_chars
-        if end == start:
-            end = start + max_chars
-
-        chunks.append((start, end))
         start = end
 
-        # Skip whitespace
-        while start < len(text) and text[start].isspace():
-            start += 1
+    final_chunks: List[ChunkIndices] = []
 
-    return chunks
+    for num_paras in [8]:
+        step = num_paras // 2
+        for idx in range(0, len(paragraph_chunks), step):
+            chunks = paragraph_chunks[idx : idx + num_paras]
+            final_chunks.append(merge_chunks(chunks))
+
+    return final_chunks
 
 
 def process_file(
@@ -175,11 +186,11 @@ def process_file(
     file_hash = hash_content(content)
     file_info = FileInfo(str(path), path.stat().st_mtime, file_hash)
 
-    chunk_ranges = chunk_text(content, max_tokens)
+    chunk_ranges: List[ChunkIndices] = chunk_text(content, max_tokens)
     chunks = []
 
     for chunk_idx, chunk_range in enumerate(chunk_ranges):
-        (start_byte, end_byte) = chunk_range
+        (start_byte, end_byte) = (chunk_range.start, chunk_range.end)
         text = content[start_byte:end_byte]
 
         embed_text = f"File: {path.name}\n\n{text}"
@@ -220,6 +231,8 @@ def create_index(
 
         except Exception as e:
             print(f"Skipping {file_path}: {e}")
+
+    all_chunks = list(sorted(all_chunks, key=lambda chunk: len(chunk.text)))
 
     print(f"Found {len(all_files)} files, {len(all_chunks)} chunks")
 
@@ -272,6 +285,7 @@ def create_index(
             file_id INTEGER NOT NULL,
             start_byte INTEGER NOT NULL,
             end_byte INTEGER NOT NULL,
+            chunk_text TEXT NOT NULL,
             chunk_hash TEXT NOT NULL,
             matrix_index INTEGER NOT NULL,
             FOREIGN KEY (file_id) REFERENCES files (id)
@@ -290,8 +304,16 @@ def create_index(
 
     for i, chunk in enumerate(all_chunks):
         conn.execute(
-            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
-            (i + 1, chunk.file_id, chunk.start_byte, chunk.end_byte, chunk.hash, i),
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                i + 1,
+                chunk.file_id,
+                chunk.start_byte,
+                chunk.end_byte,
+                chunk.text,
+                chunk.hash,
+                i,
+            ),
         )
 
     conn.commit()
@@ -302,14 +324,14 @@ def create_index(
     )
 
 
-def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchResult]:
+def search_embeddings(state: AppState, query: str, k: int) -> List[SearchResult]:
     total_search_start_time = time.time()
     embed_start_time = time.time()
     if hasattr(state.model, "encode_queries"):
         assert callable(state.model.encode_queries)
         query_embedding = state.model.encode_queries([query])[0]
     else:
-        query_embedding = state.model.encode([query])[0]
+        query_embedding = state.model.encode([query], prompt_name="query")[0]
     embed_end_time = time.time()
 
     search_start_time = time.time()
@@ -327,7 +349,7 @@ def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchRe
     placeholders = ",".join("?" * len(top_indices))
     rows = state.conn.execute(
         f"""
-        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte, f.id
+        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte, c.chunk_text, f.id
         FROM chunks c JOIN files f ON c.file_id = f.id
         WHERE c.matrix_index IN ({placeholders})
     """,
@@ -339,11 +361,11 @@ def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchRe
     index_to_row = {row[0]: row for row in rows}
 
     candidates = []
-    for idx in top_indices:
+    for bi_encoder_rank, idx in enumerate(top_indices, 1):
         if idx not in index_to_row:
             continue
 
-        _, filename, start_byte, end_byte, file_id = index_to_row[idx]
+        _, filename, start_byte, end_byte, chunk_text, file_id = index_to_row[idx]
 
         try:
             content = file_content_from_cache(state, filename)
@@ -351,11 +373,13 @@ def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchRe
             candidates.append(
                 {
                     "idx": idx,
+                    "bi_encoder_rank": bi_encoder_rank,
                     "file_id": file_id,
                     "filename": filename,
                     "chunk_content": chunk_content,
                     "start_byte": start_byte,
                     "end_byte": end_byte,
+                    "chunk_text": chunk_text,
                     "bi_encoder_score": float(similarities[idx]),
                 }
             )
@@ -384,10 +408,13 @@ def search_embeddings(state: AppState, query: str, k: int = 50) -> List[SearchRe
         results.append(
             SearchResult(
                 rank=rank,
-                similarity=candidate["cross_score"],
+                bi_encoder_rank=candidate["bi_encoder_rank"],
+                cross_encoder_score=candidate["cross_score"],
+                bi_encoder_score=candidate["bi_encoder_score"],
                 file_id=candidate["file_id"],
                 filename=Path(candidate["filename"]).name,
                 chunk_content=candidate["chunk_content"],
+                embedded_chunk_text=candidate["chunk_text"],
                 start_byte=candidate["start_byte"],
                 end_byte=candidate["end_byte"],
             )
@@ -423,15 +450,18 @@ async def search(data: Dict[str, Any], state: State) -> Dict[str, Any]:
     if not query:
         return {"results": []}
 
-    results = search_embeddings(state.inner, query)
+    results = search_embeddings(state.inner, query, state.inner.top_k)
 
     return {
         "results": [
             {
                 "rank": r.rank,
-                "similarity": r.similarity,
+                "bi_encoder_score": r.bi_encoder_score,
+                "bi_encoder_rank": r.bi_encoder_rank,
+                "cross_encoder_score": r.cross_encoder_score,
                 "filename": r.filename,
                 "chunk_content": r.chunk_content,
+                "embedded_chunk_text": r.embedded_chunk_text,
                 "start_byte": r.start_byte,
                 "end_byte": r.end_byte,
                 "file_id": r.file_id,
@@ -483,7 +513,7 @@ def main():
             route_handlers=[serve_index, search, get_file_content],
             debug=True,
         )
-        app.state.inner = create_app_state()
+        app.state.inner = create_app_state(args.top_k)
         uvicorn.run(app, host="127.0.0.1", port=8000)
 
 

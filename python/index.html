@@ -225,7 +225,9 @@
             <thead>
               <tr>
                 <th width="60">#</th>
-                <th width="80">Score</th>
+                <th width="60">Bi-encoder rank</th>
+                <th width="80">Bi-encoder score</th>
+                <th width="80">Cross-encoder score</th>
                 <th width="150">File</th>
                 <th>Content</th>
               </tr>
@@ -314,7 +316,9 @@
             (result, index) => `
                 <tr class="result-row" onclick="selectResult(${index})">
                     <td>${result.rank}</td>
-                    <td class="similarity">${result.similarity.toFixed(3)}</td>
+                    <td>${result.bi_encoder_rank}</td>
+                    <td class="similarity">${result.bi_encoder_score.toFixed(3)}</td>
+                    <td class="similarity">${result.cross_encoder_score.toFixed(3)}</td>
                     <td class="filename">${result.filename}</td>
                     <td class="chunk-preview">${escapeHtml(result.chunk_content.substring(0, 200))}${result.chunk_content.length > 200 ? "..." : ""}</td>
                 </tr>
