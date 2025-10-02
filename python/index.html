@@ -73,6 +73,32 @@
         cursor: not-allowed;
       }
 
+      .topk-container {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-left: 16px;
+      }
+      .topk-label {
+        color: #c9d1d9;
+        font-size: 14px;
+        font-weight: 500;
+      }
+      #topK {
+        width: 70px;
+        padding: 8px 12px;
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        color: #c9d1d9;
+        font-size: 14px;
+      }
+      #topK:focus {
+        outline: none;
+        border-color: #58a6ff;
+        box-shadow: 0 0 0 3px #58a6ff33;
+      }
+
       .content {
         flex: 1;
         display: flex;
@@ -217,6 +243,10 @@
           />
           <button id="searchBtn" class="search-btn">Search</button>
         </div>
+        <div class="parameter-container">
+          <label for="topK" class="parameter-label">Top K:</label>
+          <input type="number" id="topK" value="128" min="1" />
+        </div>
       </div>
 
       <div class="content">
@@ -225,6 +255,8 @@
             <thead>
               <tr>
                 <th width="60">#</th>
+                <th width="60">BM25 rank</th>
+                <th width="60">BM25 score</th>
                 <th width="60">Bi-encoder rank</th>
                 <th width="80">Bi-encoder score</th>
                 <th width="80">Cross-encoder score</th>
@@ -260,6 +292,7 @@
       const resultsBody = document.getElementById("resultsBody");
       const fileHeader = document.getElementById("fileHeader");
       const fileContent = document.getElementById("fileContent");
+      const topKInput = document.getElementById("topK");
 
       searchInput.addEventListener("keypress", (e) => {
         if (e.key === "Enter") {
@@ -271,6 +304,7 @@
 
       async function performSearch() {
         const query = searchInput.value.trim();
+        const top_k = topKInput.value.trim();
         if (!query) return;
 
         // Scroll results panel to top
@@ -286,7 +320,7 @@
             headers: {
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ query }),
+            body: JSON.stringify({ query, top_k }),
           });
 
           const data = await response.json();
@@ -315,9 +349,11 @@
           .map(
             (result, index) => `
                 <tr class="result-row" onclick="selectResult(${index})">
-                    <td>${result.rank}</td>
-                    <td>${result.bi_encoder_rank}</td>
-                    <td class="similarity">${result.bi_encoder_score.toFixed(3)}</td>
+                    <td class="similarity">${result.rank}</td>
+                    <td class="similarity">${result.bm25_rank}</td>
+                    <td class="similarity">${result.bm25_score?.toFixed(3) ?? ""}</td>
+                    <td class="similarity">${result.bi_encoder_rank}</td>
+                    <td class="similarity">${result.bi_encoder_score?.toFixed(3) ?? "N/A"}</td>
                     <td class="similarity">${result.cross_encoder_score.toFixed(3)}</td>
                     <td class="filename">${result.filename}</td>
                     <td class="chunk-preview">${escapeHtml(result.chunk_content.substring(0, 200))}${result.chunk_content.length > 200 ? "..." : ""}</td>

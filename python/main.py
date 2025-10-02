@@ -10,9 +10,12 @@ from dataclasses import dataclass
 from litestar import Litestar, get, post
 from litestar.response import Response
 from pathlib import Path
+
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from typing import List, Dict, Any, Tuple, Iterator
 from litestar.datastructures import State
+import bm25s
+import Stemmer  # type:ignore
 
 SKIP_DIRS = {
     ".git",
@@ -51,10 +54,12 @@ class AppState:
     conn: sqlite3.Connection
     embeddings: np.ndarray
     file_cache: Dict[str, str]
-    top_k: int
+    stemmer: Stemmer
+    bm25_retriever: bm25s.BM25
+    corpus: List
 
 
-def create_app_state(top_k: int) -> AppState:
+def create_app_state() -> AppState:
     # Get model name from embeddings file
     with h5py.File("embeddings.h5", "r") as f:
         model_name = f.attrs.get("model")
@@ -70,6 +75,21 @@ def create_app_state(top_k: int) -> AppState:
 
     # Open persistent DB connection
     conn = sqlite3.connect("index.db", check_same_thread=False)
+
+    rows = conn.execute(
+        """
+        SELECT c.id, c.chunk_text
+        FROM chunks c
+        """,
+    ).fetchall()
+
+    corpus = [row[1] for row in sorted(rows, key=lambda x: x[0])]
+
+    stemmer = Stemmer.Stemmer("english")
+    corpus_tokens = bm25s.tokenize(corpus, stopwords="en", stemmer=stemmer)
+    bm25_retriever = bm25s.BM25()
+    bm25_retriever.index(corpus_tokens)
+
     print("Server initialized")
 
     return AppState(
@@ -78,7 +98,9 @@ def create_app_state(top_k: int) -> AppState:
         embeddings=embeddings,
         conn=conn,
         file_cache={},
-        top_k=top_k,
+        stemmer=stemmer,
+        bm25_retriever=bm25_retriever,
+        corpus=corpus,
     )
 
 
@@ -97,8 +119,10 @@ def file_content_from_cache(state: AppState, filepath: str) -> str:
 @dataclass
 class SearchResult:
     rank: int
-    bi_encoder_rank: int
-    bi_encoder_score: float
+    bi_encoder_rank: int | None
+    bi_encoder_score: float | None
+    bm25_rank: int | None
+    bm25_score: float | None
     cross_encoder_score: float
     filename: str
     file_id: int
@@ -324,117 +348,213 @@ def create_index(
     )
 
 
-def search_embeddings(state: AppState, query: str, k: int) -> List[SearchResult]:
-    total_search_start_time = time.time()
-    embed_start_time = time.time()
+@dataclass
+class BM25Result:
+    chunk_id: int
+    rank: int
+    score: float
+    filename: str
+    file_id: int
+    start_byte: int
+    end_byte: int
+
+
+def search_bm25(state: AppState, query: str, k: int) -> List[BM25Result]:
+    bm25_query_tokens = bm25s.tokenize(query, stemmer=state.stemmer)
+    bm25_results, bm25_scores = state.bm25_retriever.retrieve(bm25_query_tokens, k=k)
+
+    chunk_ids = [int(bm25_results[0, i]) + 1 for i in range(bm25_results.shape[1])]
+
+    placeholders = ",".join("?" * len(chunk_ids))
+    rows = state.conn.execute(
+        f"""
+        SELECT c.id, f.filename, c.start_byte, c.end_byte, f.id
+        FROM chunks c JOIN files f on c.file_id = f.id
+        WHERE c.id IN ({placeholders})
+        """,
+        chunk_ids,
+    ).fetchall()
+    chunk_id2row = {row[0]: row for row in rows}
+
+    answer = []
+    for i, chunk_id in enumerate(chunk_ids):
+        _, filename, start_byte, end_byte, file_id = chunk_id2row[chunk_id]
+        answer.append(
+            BM25Result(
+                chunk_id=chunk_id,
+                rank=i + 1,
+                score=float(bm25_scores[0, i]),
+                filename=filename,
+                start_byte=start_byte,
+                end_byte=end_byte,
+                file_id=file_id,
+            )
+        )
+
+    return answer
+
+
+@dataclass
+class EmbeddingResult:
+    chunk_id: int
+    rank: int
+    score: float
+    filename: str
+    file_id: int
+    start_byte: int
+    end_byte: int
+
+
+def search_embeddings(state: AppState, query: str, k: int) -> List[EmbeddingResult]:
     if hasattr(state.model, "encode_queries"):
         assert callable(state.model.encode_queries)
         query_embedding = state.model.encode_queries([query])[0]
     else:
         query_embedding = state.model.encode([query], prompt_name="query")[0]
-    embed_end_time = time.time()
-
-    search_start_time = time.time()
     # Compute similarities
     similarities = np.dot(state.embeddings, query_embedding)
-    search_end_time = time.time()
 
-    sort_start_time = time.time()
     top_indices = heapq.nlargest(
         k, range(len(similarities)), key=similarities.__getitem__
     )
-    sort_end_time = time.time()
 
-    chunk_retrieval_start_time = time.time()
     placeholders = ",".join("?" * len(top_indices))
     rows = state.conn.execute(
         f"""
-        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte, c.chunk_text, f.id
+        SELECT c.matrix_index, f.filename, c.start_byte, c.end_byte, c.chunk_text, f.id, c.id
         FROM chunks c JOIN files f ON c.file_id = f.id
         WHERE c.matrix_index IN ({placeholders})
     """,
         top_indices,
     ).fetchall()
-    chunk_retrieval_end_time = time.time()
-
-    build_results_start_time = time.time()
     index_to_row = {row[0]: row for row in rows}
 
-    candidates = []
+    answer = []
     for bi_encoder_rank, idx in enumerate(top_indices, 1):
         if idx not in index_to_row:
             continue
 
-        _, filename, start_byte, end_byte, chunk_text, file_id = index_to_row[idx]
+        _, filename, start_byte, end_byte, chunk_text, file_id, chunk_id = index_to_row[
+            idx
+        ]
 
-        try:
-            content = file_content_from_cache(state, filename)
-            chunk_content = content[start_byte:end_byte]
-            candidates.append(
-                {
-                    "idx": idx,
-                    "bi_encoder_rank": bi_encoder_rank,
-                    "file_id": file_id,
-                    "filename": filename,
-                    "chunk_content": chunk_content,
-                    "start_byte": start_byte,
-                    "end_byte": end_byte,
-                    "chunk_text": chunk_text,
-                    "bi_encoder_score": float(similarities[idx]),
-                }
-            )
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-
-    build_results_end_time = time.time()
-
-    if candidates:
-        query_passage_pairs = []
-        for c in candidates:
-            cross_encoder_input = f"File: {c['filename']}. {c['chunk_content']}"
-            query_passage_pairs.append([query, cross_encoder_input])
-        cross_encoding_start_time = time.time()
-        cross_scores = state.cross_encoder.predict(query_passage_pairs)
-        cross_encoding_end_time = time.time()
-
-        for i, candidate in enumerate(candidates):
-            candidate["cross_score"] = float(cross_scores[i])
-
-        candidates.sort(key=lambda x: x["cross_score"], reverse=True)
-
-    results = []
-
-    for rank, candidate in enumerate(candidates, 1):
-        results.append(
-            SearchResult(
-                rank=rank,
-                bi_encoder_rank=candidate["bi_encoder_rank"],
-                cross_encoder_score=candidate["cross_score"],
-                bi_encoder_score=candidate["bi_encoder_score"],
-                file_id=candidate["file_id"],
-                filename=Path(candidate["filename"]).name,
-                chunk_content=candidate["chunk_content"],
-                embedded_chunk_text=candidate["chunk_text"],
-                start_byte=candidate["start_byte"],
-                end_byte=candidate["end_byte"],
+        # content = file_content_from_cache(state, filename)
+        # chunk_content = content[start_byte:end_byte]
+        answer.append(
+            EmbeddingResult(
+                chunk_id=chunk_id,
+                rank=bi_encoder_rank,
+                score=float(similarities[idx]),
+                filename=filename,
+                file_id=file_id,
+                start_byte=start_byte,
+                end_byte=end_byte,
             )
         )
+
+    return answer
+
+
+def search_combined(state: AppState, query: str, k: int) -> List[SearchResult]:
+    total_search_start_time = time.time()
+
+    embedding_results = search_embeddings(state, query, k)
+    bm25_results = search_bm25(state, query, k)
+
+    seen = set()
+
+    @dataclass
+    class QP:
+        chunk_id: int
+        query: str
+        passage: str
+        filename: str
+        file_id: int
+        chunk_content: str
+        start_byte: int
+        end_byte: int
+
+    for_cross_encoder: List[QP] = []
+    for result in embedding_results + bm25_results:
+        if result.chunk_id in seen:
+            continue
+        seen.add(result.chunk_id)
+
+        content = file_content_from_cache(state, result.filename)
+        chunk_content = content[result.start_byte : result.end_byte]
+        passage = f"File: {result.filename}. {chunk_content}"
+        for_cross_encoder.append(
+            QP(
+                chunk_id=result.chunk_id,
+                query=query,
+                passage=passage,
+                filename=result.filename,
+                file_id=result.file_id,
+                start_byte=result.start_byte,
+                end_byte=result.end_byte,
+                chunk_content=chunk_content,
+            )
+        )
+
+    cross_encoding_start_time = time.time()
+    cross_scores = state.cross_encoder.predict(
+        [(x.query, x.passage) for x in for_cross_encoder]
+    )
+    cross_encoding_end_time = time.time()
+
+    @dataclass
+    class QS:
+        qp: QP
+        cross_score: float
+
+    qs: List[QS] = [
+        QS(qp=qp, cross_score=float(cross_score))
+        for (qp, cross_score) in zip(for_cross_encoder, cross_scores)
+    ]
+    qs.sort(key=lambda x: x.cross_score, reverse=True)
+
+    chunk_id2er = {er.chunk_id: er for er in embedding_results}
+    chunk_id2br = {br.chunk_id: br for br in bm25_results}
+
+    answer = []
+    for idx, q in enumerate(qs):
+        result = SearchResult(
+            rank=idx + 1,
+            bi_encoder_rank=None,
+            bi_encoder_score=None,
+            bm25_rank=None,
+            bm25_score=None,
+            cross_encoder_score=q.cross_score,
+            filename=Path(q.qp.filename).name,
+            file_id=q.qp.file_id,
+            chunk_content=q.qp.chunk_content,
+            embedded_chunk_text="",
+            start_byte=q.qp.start_byte,
+            end_byte=q.qp.end_byte,
+        )
+
+        if q.qp.chunk_id in chunk_id2er:
+            er = chunk_id2er[q.qp.chunk_id]
+            result.bi_encoder_rank = er.rank
+            result.bi_encoder_score = er.score
+
+        if q.qp.chunk_id in chunk_id2br:
+            br = chunk_id2br[q.qp.chunk_id]
+            result.bm25_rank = br.rank
+            result.bm25_score = br.score
+
+        answer.append(result)
 
     total_search_end_time = time.time()
 
     timings = {
-        "embed": embed_end_time - embed_start_time,
-        "search": search_end_time - search_start_time,
-        "sort": sort_end_time - sort_start_time,
-        "chunk_retrieval": chunk_retrieval_end_time - chunk_retrieval_start_time,
-        "build_results": build_results_end_time - build_results_start_time,
         "cross_encode": cross_encoding_end_time - cross_encoding_start_time,
         "total": total_search_end_time - total_search_start_time,
     }
     for label, duration in sorted(timings.items(), key=lambda x: x[1], reverse=True):
         print(f"{label}: {duration:.2f}s")
 
-    return results
+    return answer
 
 
 @get("/")
@@ -450,7 +570,12 @@ async def search(data: Dict[str, Any], state: State) -> Dict[str, Any]:
     if not query:
         return {"results": []}
 
-    results = search_embeddings(state.inner, query, state.inner.top_k)
+    top_k = data.get("top_k")
+    if top_k is None:
+        raise KeyError("didn't find top_k")
+    top_k = int(top_k.strip())
+
+    results = search_combined(state.inner, query, top_k)
 
     return {
         "results": [
@@ -458,6 +583,8 @@ async def search(data: Dict[str, Any], state: State) -> Dict[str, Any]:
                 "rank": r.rank,
                 "bi_encoder_score": r.bi_encoder_score,
                 "bi_encoder_rank": r.bi_encoder_rank,
+                "bm25_rank": r.bm25_rank,
+                "bm25_score": r.bm25_score,
                 "cross_encoder_score": r.cross_encoder_score,
                 "filename": r.filename,
                 "chunk_content": r.chunk_content,
@@ -500,7 +627,6 @@ def main():
         "--batch-size", "-b", type=int, default=128, help="Batch size for embedding"
     )
     parser.add_argument("--query", "-q", help="Search query")
-    parser.add_argument("--top-k", "-k", type=int, default=50, help="Number of results")
 
     args = parser.parse_args()
 
@@ -513,7 +639,7 @@ def main():
             route_handlers=[serve_index, search, get_file_content],
             debug=True,
         )
-        app.state.inner = create_app_state(args.top_k)
+        app.state.inner = create_app_state()
         uvicorn.run(app, host="127.0.0.1", port=8000)
 
 
