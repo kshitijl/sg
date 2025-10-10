@@ -1,3 +1,4 @@
+from tqdm import tqdm
 import argparse
 import h5py
 import heapq
@@ -266,7 +267,7 @@ def create_index(
 
     embedding_start_time = time.time()
 
-    for i in range(0, len(texts), batch_size):
+    for i in tqdm(range(0, len(texts), batch_size)):
         batch = texts[i : i + batch_size]
         if hasattr(model, "encode_documents"):
             assert callable(model.encode_documents)
@@ -274,9 +275,9 @@ def create_index(
         else:
             batch_embeddings = model.encode(batch)
         embeddings.extend(batch_embeddings)
-        print(
-            f"Embedded batch {i // batch_size + 1}/{(len(texts) + batch_size - 1) // batch_size}"
-        )
+        # print(
+        #     f"Embedded batch {i // batch_size + 1}/{(len(texts) + batch_size - 1) // batch_size}"
+        # )
 
     # Save embeddings to HDF5
     embeddings_array = np.array(embeddings, dtype=np.float32)
